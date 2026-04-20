@@ -49,6 +49,22 @@ export const patchCaseSolveModeSchema = z.object({
   solveMode: caseSolveModeInputSchema,
 });
 
+/// Body for `PATCH /api/cases/[caseId]` when setting or clearing the repo
+/// scope. `null` explicitly clears the link; omitting the field is a no-op.
+export const patchCaseRepoLinkSchema = z
+  .object({
+    repoLinkId: z.union([z.string().min(1), z.null()]),
+  })
+  .strict();
+
+/// Union of every accepted PATCH body. Each branch is `.strict()` so clients
+/// can't send `{ solveMode, repoLinkId }` in one request — update one field
+/// at a time to keep audit + optimistic-UI semantics clean.
+export const patchCaseSchema = z.union([
+  patchCaseSolveModeSchema.strict(),
+  patchCaseRepoLinkSchema,
+]);
+
 export const createCaseInputSchema = z.object({
   title: z
     .string()
@@ -289,3 +305,5 @@ export type HandoffTargetInput = z.infer<typeof handoffTargetInputSchema>;
 export type CreateHandoffInput = z.infer<typeof createHandoffInputSchema>;
 export type ConnectRepoInputValidated = z.infer<typeof connectRepoInputSchema>;
 export type ConnectRepoRequestValidated = z.infer<typeof connectRepoRequestSchema>;
+export type PatchCaseRepoLinkInput = z.infer<typeof patchCaseRepoLinkSchema>;
+export type PatchCaseInput = z.infer<typeof patchCaseSchema>;
