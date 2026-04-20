@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
 import { getRequestUserId } from "@/lib/auth/request";
+import { listLatestSnapshotsByWorkspace } from "@/lib/services/repo-index-service";
 import {
   connectRepoToWorkspace,
   listRepoLinksForWorkspace,
@@ -22,8 +23,11 @@ export async function GET(request: NextRequest, context: RouteContext) {
   const { workspaceId } = await context.params;
 
   try {
-    const repoLinks = await listRepoLinksForWorkspace({ userId, workspaceId });
-    return NextResponse.json({ repoLinks });
+    const [repoLinks, snapshots] = await Promise.all([
+      listRepoLinksForWorkspace({ userId, workspaceId }),
+      listLatestSnapshotsByWorkspace(workspaceId),
+    ]);
+    return NextResponse.json({ repoLinks, snapshots });
   } catch (error) {
     return mapRepoLinkError(error);
   }

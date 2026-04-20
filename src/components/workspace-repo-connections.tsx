@@ -1,6 +1,14 @@
 "use client";
 
-import { CheckCircle2, Loader2, Plus, Unlink, X } from "lucide-react";
+import {
+  AlertTriangle,
+  CheckCircle2,
+  Loader2,
+  Plus,
+  RefreshCw,
+  Unlink,
+  X,
+} from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 function GithubMark({ className }: { className?: string }) {
@@ -50,6 +58,26 @@ type RepoLink = {
   createdAt: string;
 };
 
+type SnapshotSummary = {
+  id: string;
+  repoLinkId: string;
+  commitSha: string;
+  branch: string;
+  status: "SYNCING" | "READY" | "PARTIAL" | "FAILED";
+  statusDetail: string | null;
+  treeSyncedAt: string | null;
+  symbolSyncedAt: string | null;
+  fileCount: number;
+  symbolCount: number;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type RepoListResponse = {
+  repoLinks: RepoLink[];
+  snapshots: Record<string, SnapshotSummary>;
+};
+
 type RepoPickerEntry = {
   id: number;
   fullName: string;
@@ -83,6 +111,8 @@ export function WorkspaceRepoConnections({
   const [accountLoading, setAccountLoading] = useState(true);
   const [repoLinks, setRepoLinks] = useState<RepoLink[] | null>(null);
   const [repoLinksLoading, setRepoLinksLoading] = useState(true);
+  const [snapshots, setSnapshots] = useState<Record<string, SnapshotSummary>>({});
+  const [syncing, setSyncing] = useState<string | null>(null);
 
   const [banner, setBanner] = useState<
     | { tone: "success" | "error" | "info"; text: string }
@@ -132,8 +162,9 @@ export function WorkspaceRepoConnections({
       if (!response.ok) {
         throw new Error("Failed to load linked repositories.");
       }
-      const json = (await response.json()) as { repoLinks: RepoLink[] };
+      const json = (await response.json()) as RepoListResponse;
       setRepoLinks(json.repoLinks);
+      setSnapshots(json.snapshots ?? {});
     } catch (error) {
       setBanner({
         tone: "error",
@@ -192,6 +223,56 @@ export function WorkspaceRepoConnections({
       await refreshRepoLinks();
     },
     [refreshRepoLinks]
+  );
+
+  const handleResyncRepo = useCallback(
+    async (repoLink: RepoLink, opts?: { force?: boolean }) => {
+      setSyncing(repoLink.id);
+      try {
+        const response = await fetch(
+          `/api/workspaces/${workspaceId}/repos/${repoLink.id}/sync`,
+          {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ reuseExisting: !opts?.force }),
+          }
+        );
+        if (!response.ok) {
+          const body = (await response.json().catch(() => null)) as
+            | { error?: string }
+            | null;
+          throw new Error(body?.error ?? "Failed to sync repository.");
+        }
+        const json = (await response.json()) as { snapshot: SnapshotSummary };
+        setSnapshots((prev) => ({ ...prev, [repoLink.id]: json.snapshot }));
+        setBanner({
+          tone:
+            json.snapshot.status === "PARTIAL"
+              ? "info"
+              : json.snapshot.status === "FAILED"
+                ? "error"
+                : "success",
+          text:
+            json.snapshot.status === "PARTIAL"
+              ? `${repoLink.fullName} synced (partial: ${json.snapshot.statusDetail ?? "see snapshot"}).`
+              : json.snapshot.status === "FAILED"
+                ? `Sync failed for ${repoLink.fullName}: ${json.snapshot.statusDetail ?? "unknown error"}.`
+                : `${repoLink.fullName} synced (${json.snapshot.fileCount} files).`,
+        });
+      } catch (error) {
+        setBanner({
+          tone: "error",
+          text:
+            error instanceof Error
+              ? error.message
+              : "Failed to sync repository.",
+        });
+      } finally {
+        setSyncing(null);
+      }
+    },
+    [workspaceId]
   );
 
   const handleDisconnectRepo = useCallback(
@@ -394,34 +475,56 @@ export function WorkspaceRepoConnections({
           </div>
         ) : (
           <ul className="flex flex-col divide-y divide-[var(--color-border-subtle)] rounded-[var(--radius-sm)] border border-[var(--color-border-subtle)]">
-            {(repoLinks ?? []).map((repo) => (
-              <li
-                key={repo.id}
-                className="flex flex-wrap items-center justify-between gap-2 px-3 py-2.5"
-              >
-                <div className="flex min-w-0 flex-col">
-                  <a
-                    href={repo.remoteUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="truncate text-[13px] font-medium leading-[17px] text-[var(--color-text-primary)] hover:underline"
-                  >
-                    {repo.fullName}
-                  </a>
-                  <span className="truncate targ-micro leading-[15px] text-[var(--color-text-muted)]">
-                    default branch: {repo.defaultBranch} · visibility: {repo.visibility.toLowerCase()}
-                  </span>
-                </div>
-                <Button
-                  variant="tertiary"
-                  onClick={() => handleDisconnectRepo(repo)}
-                  className="inline-flex items-center gap-1"
+            {(repoLinks ?? []).map((repo) => {
+              const snapshot = snapshots[repo.id];
+              const isSyncing = syncing === repo.id;
+              return (
+                <li
+                  key={repo.id}
+                  className="flex flex-wrap items-center justify-between gap-2 px-3 py-2.5"
                 >
-                  <Unlink className="h-3.5 w-3.5" />
-                  Unlink
-                </Button>
-              </li>
-            ))}
+                  <div className="flex min-w-0 flex-col">
+                    <a
+                      href={repo.remoteUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="truncate text-[13px] font-medium leading-[17px] text-[var(--color-text-primary)] hover:underline"
+                    >
+                      {repo.fullName}
+                    </a>
+                    <span className="truncate targ-micro leading-[15px] text-[var(--color-text-muted)]">
+                      default branch: {repo.defaultBranch} · visibility: {repo.visibility.toLowerCase()}
+                    </span>
+                    <SnapshotMeta snapshot={snapshot} />
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <SnapshotChip snapshot={snapshot} syncing={isSyncing} />
+                    <Button
+                      variant="secondary"
+                      onClick={() => handleResyncRepo(repo)}
+                      disabled={isSyncing}
+                      className="inline-flex items-center gap-1"
+                    >
+                      <RefreshCw
+                        className={cn(
+                          "h-3.5 w-3.5",
+                          isSyncing && "animate-spin"
+                        )}
+                      />
+                      {snapshot ? "Re-sync" : "Sync"}
+                    </Button>
+                    <Button
+                      variant="tertiary"
+                      onClick={() => handleDisconnectRepo(repo)}
+                      className="inline-flex items-center gap-1"
+                    >
+                      <Unlink className="h-3.5 w-3.5" />
+                      Unlink
+                    </Button>
+                  </div>
+                </li>
+              );
+            })}
           </ul>
         )}
       </div>
@@ -591,6 +694,106 @@ function RepoPicker({
       </div>
     </div>
   );
+}
+
+function SnapshotChip({
+  snapshot,
+  syncing,
+}: {
+  snapshot: SnapshotSummary | undefined;
+  syncing: boolean;
+}) {
+  if (syncing) {
+    return (
+      <Chip tone="subtle" className="inline-flex items-center gap-1">
+        <Loader2 className="h-3 w-3 animate-spin" />
+        Syncing
+      </Chip>
+    );
+  }
+  if (!snapshot) {
+    return (
+      <Chip tone="subtle" className="inline-flex items-center gap-1">
+        Not synced
+      </Chip>
+    );
+  }
+  switch (snapshot.status) {
+    case "READY":
+      return (
+        <Chip tone="success" className="inline-flex items-center gap-1">
+          <CheckCircle2 className="h-3 w-3" />
+          Synced
+        </Chip>
+      );
+    case "PARTIAL":
+      return (
+        <Chip
+          tone="warning"
+          className="inline-flex items-center gap-1"
+          title={snapshot.statusDetail ?? undefined}
+        >
+          <AlertTriangle className="h-3 w-3" />
+          Partial
+        </Chip>
+      );
+    case "FAILED":
+      return (
+        <Chip
+          tone="critical"
+          className="inline-flex items-center gap-1"
+          title={snapshot.statusDetail ?? undefined}
+        >
+          <AlertTriangle className="h-3 w-3" />
+          Failed
+        </Chip>
+      );
+    case "SYNCING":
+      return (
+        <Chip tone="subtle" className="inline-flex items-center gap-1">
+          <Loader2 className="h-3 w-3 animate-spin" />
+          Syncing
+        </Chip>
+      );
+    default:
+      return null;
+  }
+}
+
+function SnapshotMeta({
+  snapshot,
+}: {
+  snapshot: SnapshotSummary | undefined;
+}) {
+  if (!snapshot || !snapshot.treeSyncedAt) return null;
+  const when = new Date(snapshot.treeSyncedAt);
+  const shortSha = snapshot.commitSha.slice(0, 7);
+  const files =
+    snapshot.fileCount === 1 ? "1 file" : `${snapshot.fileCount.toLocaleString()} files`;
+  return (
+    <span className="truncate targ-micro leading-[15px] text-[var(--color-text-muted)]">
+      {files} @ {shortSha} · synced {formatRelative(when)}
+    </span>
+  );
+}
+
+function formatRelative(date: Date): string {
+  const diff = Date.now() - date.getTime();
+  const abs = Math.abs(diff);
+  const minute = 60_000;
+  const hour = 60 * minute;
+  const day = 24 * hour;
+  if (abs < minute) return "just now";
+  if (abs < hour) {
+    const n = Math.round(abs / minute);
+    return `${n}m ago`;
+  }
+  if (abs < day) {
+    const n = Math.round(abs / hour);
+    return `${n}h ago`;
+  }
+  const n = Math.round(abs / day);
+  return `${n}d ago`;
 }
 
 function describeOAuthErrorCode(code: string): string {

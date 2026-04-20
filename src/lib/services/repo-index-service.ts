@@ -377,6 +377,44 @@ export async function isRepoSnapshotStale(repoLinkId: string): Promise<boolean> 
   return Date.now() - treeSyncedAt.getTime() > SNAPSHOT_FRESHNESS_MS;
 }
 
+/// Returns latest-snapshot summaries for every repo link in a workspace, keyed
+/// by repoLinkId. Used by the repo-listing API so the UI can render sync chips
+/// in the same payload as the link rows.
+export async function listLatestSnapshotsByWorkspace(
+  workspaceId: string
+): Promise<Record<string, RepoSnapshotSummary>> {
+  const links = await prisma.targRepoLink.findMany({
+    where: { workspaceId, latestSnapshotId: { not: null } },
+    select: {
+      id: true,
+      latestSnapshot: {
+        select: {
+          id: true,
+          repoLinkId: true,
+          commitSha: true,
+          branch: true,
+          status: true,
+          statusDetail: true,
+          treeSyncedAt: true,
+          symbolSyncedAt: true,
+          fileCount: true,
+          symbolCount: true,
+          createdAt: true,
+          updatedAt: true,
+        },
+      },
+    },
+  });
+
+  const result: Record<string, RepoSnapshotSummary> = {};
+  for (const link of links) {
+    if (link.latestSnapshot) {
+      result[link.id] = toSummary(link.latestSnapshot, true);
+    }
+  }
+  return result;
+}
+
 export async function getLatestSnapshotSummary(
   repoLinkId: string
 ): Promise<RepoSnapshotSummary | null> {
