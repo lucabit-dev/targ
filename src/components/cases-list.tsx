@@ -1,3 +1,4 @@
+import { Link2 } from "lucide-react";
 import Link from "next/link";
 
 import { Chip, Surface } from "@/components/ui/primitives";
@@ -21,6 +22,10 @@ export type CaseListItem = {
   updatedAt: Date | string;
   statusLabel?: string;
   evidenceCount?: number;
+  /// `owner/repo` when the case is scoped to a repo (Phase 2.4). Rendered as
+  /// a subtle chip so users can see at a glance which cases already have a
+  /// code-context scope.
+  repoFullName?: string | null;
 };
 
 type CasesListProps = {
@@ -329,6 +334,18 @@ export function CasesList({
                   >
                     {formatRelativeDate(currentCase.updatedAt)}
                   </Chip>
+
+                  {currentCase.repoFullName ? (
+                    <Chip
+                      className={cn(subtleMetaChipClass(), "inline-flex items-center gap-1")}
+                      title={`Scoped to ${currentCase.repoFullName}. Handoff packets emit clickable GitHub links.`}
+                    >
+                      <Link2 className="h-2.5 w-2.5" aria-hidden />
+                      <span className="truncate max-w-[12rem]">
+                        {currentCase.repoFullName}
+                      </span>
+                    </Chip>
+                  ) : null}
                 </div>
               </div>
             </Link>

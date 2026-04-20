@@ -8,10 +8,13 @@ export default async function CasesPage() {
   const currentUser = await requireCurrentUser();
   const cases = await listCasesForUser(currentUser.user.id);
   const caseItems: CaseListItem[] = cases.map(
-    ({ _count, ...rest }) => ({
+    ({ _count, repoLink, ...rest }) => ({
       ...rest,
       evidenceCount: _count.evidence,
       statusLabel: getCaseListStatusLabel(rest),
+      repoFullName: repoLink
+        ? `${repoLink.ownerLogin}/${repoLink.repoName}`
+        : null,
     })
   );
 
