@@ -33,6 +33,7 @@ import {
   type HandoffTargetId,
 } from "@/lib/handoff/targets";
 import { truncatePacketToBudget } from "@/lib/handoff/truncate";
+import { loadRepoEnrichmentForCase } from "@/lib/services/handoff-enrichment-service";
 
 // Bumped when the packet-producing logic (builder, renderers, truncation)
 // changes in a way that affects how a receiver should interpret the packet.
@@ -170,6 +171,26 @@ export async function createHandoffPacket(
       generatorVersion: GENERATOR_VERSION,
     },
   };
+
+  // Best-effort repo enrichment (Phase 2.3). Errors are swallowed inside the
+  // service — handoff must always produce a packet even when the repo index
+  // is unavailable, so `loadRepoEnrichmentForCase` returns undefined in all
+  // degraded cases and the builder falls back to its pre-2.3 behaviour.
+  try {
+    const enrichment = await loadRepoEnrichmentForCase({
+      userId: request.userId,
+      caseId: request.caseId,
+      input,
+    });
+    if (enrichment) {
+      input.repoEnrichment = enrichment;
+    }
+  } catch (error) {
+    console.warn("[handoff] repo enrichment failed; continuing unenriched", {
+      caseId: request.caseId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
 
   let packet: HandoffPacket;
   try {
