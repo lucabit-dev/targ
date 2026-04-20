@@ -149,6 +149,42 @@ enum RepoVisibility {
   UNKNOWN
 }
 
+/// Lifecycle of a TargRepoSnapshot (a pinned point-in-time index of a repo).
+///
+/// `PARTIAL` is used when a cap is hit (file count, symbol count, size) — the
+/// snapshot is usable but incomplete, and the UI should surface that.
+enum RepoSnapshotStatus {
+  SYNCING
+  READY
+  PARTIAL
+  FAILED
+}
+
+/// Coarse classification of a repo file, inferred from path + extension only.
+/// Used by the resolver to bias matches away from tests / fixtures when the
+/// evidence is clearly about production code.
+enum RepoFileKind {
+  CODE
+  TEST
+  CONFIG
+  DOCS
+  ASSET
+  OTHER
+}
+
+/// Top-level symbol categories extracted during symbol indexing. Keep coarse
+/// on purpose: resolver bias is by kind, not by fine-grained language specifics.
+enum RepoSymbolKind {
+  FUNCTION
+  METHOD
+  CLASS
+  TYPE
+  INTERFACE
+  COMPONENT
+  VARIABLE
+  ENUM
+}
+
 model User {
   id                 String                @id @default(cuid())
   email              String                @unique
@@ -470,27 +506,110 @@ model TargGithubAccount {
 /// A workspace <-> external repo association. Source of truth for repo context
 /// used by the Handoff Packet (paths, branches, commit SHAs).
 model TargRepoLink {
-  id                String         @id @default(cuid())
+  id                String             @id @default(cuid())
   workspaceId       String
   /// Which user's OAuth token authorised this link. If that user loses access
   /// we may need to prompt another member to re-auth.
   connectedByUserId String
-  provider          RepoProvider   @default(GITHUB)
+  provider          RepoProvider       @default(GITHUB)
   /// Provider's numeric repo id. Stable across renames.
   githubRepoId      Int
   ownerLogin        String
   repoName          String
   defaultBranch     String
   remoteUrl         String
-  visibility        RepoVisibility @default(UNKNOWN)
+  visibility        RepoVisibility     @default(UNKNOWN)
   lastSyncedAt      DateTime?
-  createdAt         DateTime       @default(now())
-  updatedAt         DateTime       @updatedAt
-  workspace         Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
-  connectedByUser   User           @relation("RepoLinksConnectedByUser", fields: [connectedByUserId], references: [id], onDelete: Cascade)
+  /// Pointer to the most recent READY/PARTIAL snapshot for fast lookup. Null
+  /// until the first sync completes. Also null if the latest snapshot FAILED.
+  latestSnapshotId  String?            @unique
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+  workspace         Workspace          @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  connectedByUser   User               @relation("RepoLinksConnectedByUser", fields: [connectedByUserId], references: [id], onDelete: Cascade)
   cases             TargCase[]
+  snapshots         TargRepoSnapshot[] @relation("RepoSnapshotsForLink")
+  latestSnapshot    TargRepoSnapshot?  @relation("LatestSnapshotForLink", fields: [latestSnapshotId], references: [id], onDelete: SetNull)
 
   @@unique([workspaceId, githubRepoId])
   @@index([workspaceId])
   @@index([connectedByUserId])
+}
+
+/// A pinned point-in-time index of a repository at a specific commit. One row
+/// per (repoLinkId, commitSha). The file/symbol tables are partitioned by
+/// snapshotId so old snapshots stay queryable until we decide to prune.
+model TargRepoSnapshot {
+  id             String             @id @default(cuid())
+  repoLinkId     String
+  /// The commit SHA this snapshot pins. 40-char hex for GitHub.
+  commitSha      String
+  /// Which branch we read the tree from (usually the repo's default branch).
+  branch         String
+  status         RepoSnapshotStatus @default(SYNCING)
+  /// Reason a snapshot is PARTIAL or FAILED, surfaced to the UI.
+  statusDetail   String?
+  /// Wall clocks for the two sync phases (tree fetch, symbol extraction).
+  treeSyncedAt   DateTime?
+  symbolSyncedAt DateTime?
+  /// Totals populated as each phase completes; used by the UI status chip.
+  fileCount      Int                @default(0)
+  symbolCount    Int                @default(0)
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+  repoLink       TargRepoLink       @relation("RepoSnapshotsForLink", fields: [repoLinkId], references: [id], onDelete: Cascade)
+  linkedAsLatest TargRepoLink?      @relation("LatestSnapshotForLink")
+  files          TargRepoFile[]
+  symbols        TargRepoSymbol[]
+
+  @@unique([repoLinkId, commitSha])
+  @@index([repoLinkId, createdAt(sort: Desc)])
+  @@index([status])
+}
+
+/// One row per file in a snapshot's default-branch tree. `blobSha` is the
+/// GitHub blob SHA so we can detect unchanged files across resyncs and skip
+/// re-parsing them during symbol indexing.
+model TargRepoFile {
+  id         String           @id @default(cuid())
+  snapshotId String
+  path       String
+  size       Int
+  blobSha    String
+  kind       RepoFileKind     @default(OTHER)
+  /// Best-effort language label derived from extension (e.g. "typescript",
+  /// "python", "markdown"). Null for binaries / unknown extensions.
+  language   String?
+  createdAt  DateTime         @default(now())
+  snapshot   TargRepoSnapshot @relation(fields: [snapshotId], references: [id], onDelete: Cascade)
+  symbols    TargRepoSymbol[]
+
+  @@unique([snapshotId, path])
+  @@index([snapshotId, kind])
+  @@index([snapshotId, language])
+}
+
+/// Top-level named symbol inside a TargRepoFile. Populated by the symbol
+/// indexer during Phase 2.2e (TS/JS/TSX/JSX only in the first cut). Used by
+/// the resolver to answer "evidence mentions `processPayment` — where is it?".
+model TargRepoSymbol {
+  id         String           @id @default(cuid())
+  snapshotId String
+  fileId     String
+  name       String
+  kind       RepoSymbolKind
+  /// 1-based line number of the symbol declaration start.
+  line       Int
+  /// 1-based line number of the symbol declaration end (null if trivial).
+  endLine    Int?
+  /// Whether the symbol is exported from the module. Helps the resolver
+  /// prefer public API surfaces over internal helpers.
+  exported   Boolean          @default(false)
+  createdAt  DateTime         @default(now())
+  snapshot   TargRepoSnapshot @relation(fields: [snapshotId], references: [id], onDelete: Cascade)
+  file       TargRepoFile     @relation(fields: [fileId], references: [id], onDelete: Cascade)
+
+  @@index([snapshotId, name])
+  @@index([snapshotId, kind])
+  @@index([fileId])
 }
