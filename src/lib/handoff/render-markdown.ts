@@ -74,8 +74,8 @@ function renderBestRead(packet: HandoffPacket): string {
   const area = packet.read.affectedArea;
   const areaLineParts = [`**Affected area:** ${area.label}`];
   if (area.repoLocation) {
-    const loc = formatRepoLocationInline(area.repoLocation);
-    if (loc) areaLineParts.push(`→ \`${loc}\``);
+    const pretty = formatRepoLocationLink(area.repoLocation, packet.repoContext);
+    if (pretty) areaLineParts.push(`→ ${pretty}`);
   }
   lines.push("", wrap(areaLineParts.join(" ")));
 
@@ -88,19 +88,53 @@ function formatRepoLocationInline(location: RepoLocation): string {
     : location.file;
 }
 
+/// Builds a GitHub blob URL for a location when `repoContext` carries the
+/// `owner/repo` + ref pair. Falls back to a plain backticked label otherwise
+/// (e.g. CLI-driven packets that set a RepoLocation without a repoContext).
+function formatRepoLocationLink(
+  location: RepoLocation,
+  repoContext: HandoffPacket["repoContext"]
+): string {
+  const label = formatRepoLocationInline(location);
+  const url = buildBlobUrl(location, repoContext);
+  if (!url) return `\`${label}\``;
+  return `[\`${label}\`](${url})`;
+}
+
+function buildBlobUrl(
+  location: RepoLocation,
+  repoContext: HandoffPacket["repoContext"]
+): string | null {
+  if (!repoContext) return null;
+  if (!repoContext.repoFullName || !repoContext.ref) return null;
+  // Encode each path segment but keep slashes — GitHub rejects `%2F` in blob
+  // URLs. We also reject file paths with illegal control chars to avoid
+  // producing broken links when enrichment misbehaves.
+  const path = location.file
+    .split("/")
+    .map((seg) => encodeURIComponent(seg))
+    .join("/");
+  const suffix =
+    typeof location.line === "number" ? `#L${location.line}` : "";
+  return `https://github.com/${repoContext.repoFullName}/blob/${repoContext.ref}/${path}${suffix}`;
+}
+
 function renderEvidence(
   packet: HandoffPacket,
   indexMap: Map<string, number>
 ): string {
   if (packet.evidence.length === 0) return "";
 
-  const items = packet.evidence.map((item) => renderEvidenceItem(item, indexMap));
+  const items = packet.evidence.map((item) =>
+    renderEvidenceItem(item, indexMap, packet.repoContext)
+  );
   return ["## Evidence", "", items.join("\n\n")].join("\n");
 }
 
 function renderEvidenceItem(
   item: HandoffEvidenceItem,
-  indexMap: Map<string, number>
+  indexMap: Map<string, number>,
+  repoContext: HandoffPacket["repoContext"]
 ): string {
   const index = indexMap.get(item.id) ?? 0;
   const header = `${index}. **${item.name}** (${item.kind}, ${item.source})`;
@@ -109,14 +143,34 @@ function renderEvidenceItem(
     .map((line) => `   ${line}`)
     .join("\n");
 
+  const locationLines = renderEvidenceLocations(item.repoLocations, repoContext);
+
   const body = item.excerpt ?? item.screenshotText;
-  if (!body) return `${header}\n${summary}`;
+  if (!body) {
+    return [header, summary, locationLines].filter(Boolean).join("\n");
+  }
 
   const fencedBody = body
     .split("\n")
     .map((line) => `   ${line}`)
     .join("\n");
-  return `${header}\n${summary}\n   \`\`\`\n${fencedBody}\n   \`\`\``;
+  const core = `${header}\n${summary}\n   \`\`\`\n${fencedBody}\n   \`\`\``;
+  return locationLines ? `${core}\n${locationLines}` : core;
+}
+
+/// Renders per-evidence `repoLocations` as a compact nested list immediately
+/// below the summary / code fence. Only emitted when the enclosing packet
+/// carries enough context to produce blob URLs — otherwise the inline form
+/// (backticked path:line) stands in.
+function renderEvidenceLocations(
+  locations: RepoLocation[] | undefined,
+  repoContext: HandoffPacket["repoContext"]
+): string {
+  if (!locations || locations.length === 0) return "";
+  const lines = locations.map(
+    (loc) => `   - In repo: ${formatRepoLocationLink(loc, repoContext)}`
+  );
+  return lines.join("\n");
 }
 
 function renderHypotheses(
@@ -187,9 +241,14 @@ function renderRepoContext(packet: HandoffPacket): string {
   if (!ctx) return "";
 
   const lines: string[] = [];
+  // Preamble: name the repo + ref so downstream receivers know what they're
+  // looking at. Compact form is a Markdown link when we can build a valid
+  // blob URL; otherwise just the owner/repo@ref string.
+  lines.push(formatRepoContextHeader(ctx));
+
   if (ctx.stackLocations && ctx.stackLocations.length > 0) {
     for (const location of ctx.stackLocations) {
-      lines.push(formatBullet(formatRepoLocationBullet(location)));
+      lines.push(formatBullet(formatRepoLocationBullet(location, ctx)));
     }
   }
   if (ctx.suspectedRegressions && ctx.suspectedRegressions.length > 0) {
@@ -199,20 +258,30 @@ function renderRepoContext(packet: HandoffPacket): string {
       lines.push(`  - ${pr} by @${commit.author}: "${commit.message}"`);
     }
   }
-  if (lines.length === 0) return "";
-
   return ["## Repo context", "", lines.join("\n")].join("\n");
 }
 
-function formatRepoLocationBullet(location: RepoLocation): string {
-  const locator = formatRepoLocationInline(location);
-  if (!location.blame) return `\`${locator}\``;
+function formatRepoContextHeader(ctx: NonNullable<HandoffPacket["repoContext"]>): string {
+  const refShort = ctx.ref.length >= 40 ? ctx.ref.slice(0, 7) : ctx.ref;
+  if (ctx.repoFullName && ctx.ref) {
+    const treeUrl = `https://github.com/${ctx.repoFullName}/tree/${ctx.ref}`;
+    return `**Repo:** [${ctx.repoFullName}@${refShort}](${treeUrl})`;
+  }
+  return `**Repo:** ${ctx.repoFullName}@${refShort}`;
+}
+
+function formatRepoLocationBullet(
+  location: RepoLocation,
+  repoContext: HandoffPacket["repoContext"]
+): string {
+  const linked = formatRepoLocationLink(location, repoContext);
+  if (!location.blame) return linked;
 
   const who = location.blame.prNumber
     ? `#${location.blame.prNumber}`
     : `commit ${location.blame.commitSha.slice(0, 7)}`;
   const when = formatRelativeDate(location.blame.date);
-  return `\`${locator}\` — last changed in ${who} by @${location.blame.author}, ${when}: "${location.blame.commitMessage}"`;
+  return `${linked} — last changed in ${who} by @${location.blame.author}, ${when}: "${location.blame.commitMessage}"`;
 }
 
 function formatRelativeDate(isoDate: string): string {

@@ -143,6 +143,136 @@ describe("handoff packet — contradiction_split_service_failure fixture", () =>
   });
 });
 
+describe("repo enrichment rendering (Phase 2.3)", () => {
+  it("emits a GitHub blob URL for the affected area when repoContext carries a ref", () => {
+    const enriched = buildHandoffPacket({
+      ...CONTRADICTION_FIXTURE_INPUT,
+      repoEnrichment: {
+        repoFullName: "acme/checkout",
+        ref: "deadbeefcafebabedeadbeefcafebabedeadbeef",
+        affectedAreaLocation: {
+          file: "src/lib/checkout-service.ts",
+          line: 42,
+        },
+      },
+    });
+    const markdown = renderPacketMarkdown(enriched);
+    expect(markdown).toContain(
+      "[`src/lib/checkout-service.ts:42`](https://github.com/acme/checkout/blob/deadbeefcafebabedeadbeefcafebabedeadbeef/src/lib/checkout-service.ts#L42)"
+    );
+  });
+
+  it("renders per-evidence repoLocations under each item as a nested bullet list", () => {
+    const enriched = buildHandoffPacket({
+      ...CONTRADICTION_FIXTURE_INPUT,
+      repoEnrichment: {
+        repoFullName: "acme/checkout",
+        ref: "deadbeef",
+        evidenceLocations: {
+          [apiEvidenceId]: [
+            { file: "src/lib/api/checkout.ts", line: 10 },
+            { file: "src/lib/api/checkout.ts", line: 44 },
+          ],
+        },
+      },
+    });
+    const markdown = renderPacketMarkdown(enriched);
+    expect(markdown).toContain(
+      "   - In repo: [`src/lib/api/checkout.ts:10`](https://github.com/acme/checkout/blob/deadbeef/src/lib/api/checkout.ts#L10)"
+    );
+    expect(markdown).toContain(
+      "   - In repo: [`src/lib/api/checkout.ts:44`](https://github.com/acme/checkout/blob/deadbeef/src/lib/api/checkout.ts#L44)"
+    );
+  });
+
+  it("emits a Repo context section with tree link + stack locations", () => {
+    const enriched = buildHandoffPacket({
+      ...CONTRADICTION_FIXTURE_INPUT,
+      repoEnrichment: {
+        repoFullName: "acme/checkout",
+        ref: "abcdef1234567890abcdef1234567890abcdef12",
+        stackLocations: [
+          { file: "src/lib/checkout.ts", line: 42 },
+          { file: "src/lib/worker.ts", line: 12 },
+        ],
+      },
+    });
+    const markdown = renderPacketMarkdown(enriched);
+    expect(markdown).toContain("## Repo context");
+    expect(markdown).toContain(
+      "**Repo:** [acme/checkout@abcdef1](https://github.com/acme/checkout/tree/abcdef1234567890abcdef1234567890abcdef12)"
+    );
+    expect(markdown).toContain(
+      "[`src/lib/checkout.ts:42`](https://github.com/acme/checkout/blob/abcdef1234567890abcdef1234567890abcdef12/src/lib/checkout.ts#L42)"
+    );
+    expect(markdown).toContain(
+      "[`src/lib/worker.ts:12`](https://github.com/acme/checkout/blob/abcdef1234567890abcdef1234567890abcdef12/src/lib/worker.ts#L12)"
+    );
+  });
+
+  it("falls back to plain backticks when a RepoLocation has no enclosing repoContext", () => {
+    // A CLI-driven packet that sets RepoLocation directly but not repoContext.
+    const packet = buildHandoffPacket({
+      ...CONTRADICTION_FIXTURE_INPUT,
+      repoContext: undefined,
+    });
+    // Inject a location into affected area via a post-build mutation — we're
+    // exercising the renderer contract, not the builder here.
+    const mutated = {
+      ...packet,
+      read: {
+        ...packet.read,
+        affectedArea: {
+          ...packet.read.affectedArea,
+          repoLocation: { file: "src/lib/foo.ts", line: 10 },
+        },
+      },
+    };
+    const markdown = renderPacketMarkdown(mutated);
+    expect(markdown).toContain("`src/lib/foo.ts:10`");
+    expect(markdown).not.toContain("https://github.com/");
+  });
+
+  it("percent-encodes reserved chars in path segments but keeps slashes when building blob URLs", () => {
+    const enriched = buildHandoffPacket({
+      ...CONTRADICTION_FIXTURE_INPUT,
+      repoEnrichment: {
+        repoFullName: "acme/checkout",
+        ref: "deadbeef",
+        affectedAreaLocation: {
+          // Next.js route-group + dynamic-segment syntax: parens are
+          // unreserved per encodeURIComponent's spec (kept verbatim), but
+          // square brackets are reserved and MUST be encoded for GitHub.
+          file: "src/app/(app)/cases/[caseId]/page.tsx",
+          line: 7,
+        },
+      },
+    });
+    const markdown = renderPacketMarkdown(enriched);
+    expect(markdown).toContain(
+      "https://github.com/acme/checkout/blob/deadbeef/src/app/(app)/cases/%5BcaseId%5D/page.tsx#L7"
+    );
+    // Path separators must NEVER be encoded — GitHub rejects %2F in blob URLs.
+    expect(markdown).not.toContain("src%2Fapp");
+  });
+
+  it("omits the #Lnn suffix when the location has no line number", () => {
+    const enriched = buildHandoffPacket({
+      ...CONTRADICTION_FIXTURE_INPUT,
+      repoEnrichment: {
+        repoFullName: "acme/checkout",
+        ref: "main",
+        affectedAreaLocation: { file: "src/lib/foo.ts" },
+      },
+    });
+    const markdown = renderPacketMarkdown(enriched);
+    expect(markdown).toContain(
+      "[`src/lib/foo.ts`](https://github.com/acme/checkout/blob/main/src/lib/foo.ts)"
+    );
+    expect(markdown).not.toMatch(/src\/lib\/foo\.ts#L/);
+  });
+});
+
 describe("cursor target rendering (spec §7.1)", () => {
   it("prepends the TARG preamble and appends the agent-instructions block", () => {
     const packet = buildHandoffPacket(CONTRADICTION_FIXTURE_INPUT);
