@@ -1,0 +1,16 @@
+{
+  "id": "insufficient_evidence_sparse_failure",
+  "category": "insufficient_evidence",
+  "title": "Sparse failure report with no concrete evidence",
+  "userProblemStatement": "Users say the app breaks, but I only have a vague report so far.",
+  "evidence": [],
+  "clarifyingAnswers": ["Production error or exception"],
+  "expected": {
+    "confidence": "plausible",
+    "nextActionMode": "request_input",
+    "draftType": "investigation",
+    "shouldAskQuestion": true,
+    "riskyContradiction": false,
+    "majorClaimKeywords": ["application", "provisional", "evidence"]
+  }
+}

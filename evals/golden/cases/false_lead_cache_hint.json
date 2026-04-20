@@ -1,0 +1,29 @@
+{
+  "id": "false_lead_cache_hint",
+  "category": "false_lead",
+  "title": "One note blames cache, but the failure evidence is weak",
+  "userProblemStatement": "A teammate suspects cache invalidation, but the only concrete evidence is a thin API log.",
+  "evidence": [
+    {
+      "kind": "note",
+      "source": "manual_note",
+      "originalName": "teammate-note",
+      "rawText": "I think this is probably cache related because the issue looks stale after deploy."
+    },
+    {
+      "kind": "log",
+      "source": "paste",
+      "originalName": "api-log",
+      "rawText": "2026-04-09T00:00:00Z service=api requestId=req-700 GET /api/cache\nError: read failed\n    at loadCacheEntry (/srv/cache.js:10:2)"
+    }
+  ],
+  "clarifyingAnswers": [],
+  "expected": {
+    "confidence": "plausible",
+    "nextActionMode": "verify",
+    "draftType": "investigation",
+    "shouldAskQuestion": false,
+    "riskyContradiction": false,
+    "majorClaimKeywords": ["api", "cache", "verify"]
+  }
+}

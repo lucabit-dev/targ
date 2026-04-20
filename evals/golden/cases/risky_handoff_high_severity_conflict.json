@@ -1,0 +1,30 @@
+{
+  "id": "risky_handoff_high_severity_conflict",
+  "category": "risky_handoff_case",
+  "title": "High severity failure with conflicting service evidence",
+  "userProblemStatement": "Production checkout failures are high severity and the evidence conflicts across services.",
+  "severity": "HIGH",
+  "evidence": [
+    {
+      "kind": "log",
+      "source": "paste",
+      "originalName": "api-prod-log",
+      "rawText": "2026-04-09T00:00:00Z service=api requestId=req-900 GET /api/checkout\nError: failed\n    at submitCheckout (/srv/checkout.js:44:9)"
+    },
+    {
+      "kind": "terminal",
+      "source": "paste",
+      "originalName": "worker-prod-log",
+      "rawText": "service=worker\nretry loop failed in production checkout flow\n    at runWorker (/srv/worker.js:12:2)"
+    }
+  ],
+  "clarifyingAnswers": [],
+  "expected": {
+    "confidence": "unclear",
+    "nextActionMode": "request_input",
+    "draftType": "none",
+    "shouldAskQuestion": false,
+    "riskyContradiction": true,
+    "majorClaimKeywords": ["production", "api", "worker"]
+  }
+}

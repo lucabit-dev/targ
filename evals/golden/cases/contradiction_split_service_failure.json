@@ -1,0 +1,29 @@
+{
+  "id": "contradiction_split_service_failure",
+  "category": "contradiction",
+  "title": "API and worker evidence disagree on the failing boundary",
+  "userProblemStatement": "Checkout failures look split across the API and worker layers.",
+  "evidence": [
+    {
+      "kind": "log",
+      "source": "paste",
+      "originalName": "api-log",
+      "rawText": "2026-04-09T00:00:00Z service=api requestId=req-600 GET /api/checkout\nError: failed\n    at submitCheckout (/srv/checkout.js:44:9)"
+    },
+    {
+      "kind": "terminal",
+      "source": "paste",
+      "originalName": "worker-log",
+      "rawText": "service=worker\nretry loop failed\n    at runWorker (/srv/worker.js:12:2)"
+    }
+  ],
+  "clarifyingAnswers": [],
+  "expected": {
+    "confidence": "unclear",
+    "nextActionMode": "request_input",
+    "draftType": "none",
+    "shouldAskQuestion": false,
+    "riskyContradiction": true,
+    "majorClaimKeywords": ["api", "worker", "checkout"]
+  }
+}

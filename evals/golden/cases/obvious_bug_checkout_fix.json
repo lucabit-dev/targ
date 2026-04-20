@@ -1,0 +1,29 @@
+{
+  "id": "obvious_bug_checkout_fix",
+  "category": "obvious_bug",
+  "title": "Checkout API throws a clear runtime error",
+  "userProblemStatement": "Checkout fails consistently after submit and the logs point at one API boundary.",
+  "evidence": [
+    {
+      "kind": "log",
+      "source": "paste",
+      "originalName": "api-log-a",
+      "rawText": "2026-04-09T00:00:00Z service=api requestId=req-500 GET /api/checkout\nError: payment failed\n    at submitCheckout (/srv/checkout.js:44:9)"
+    },
+    {
+      "kind": "terminal",
+      "source": "paste",
+      "originalName": "api-terminal-b",
+      "rawText": "2026-04-09T00:00:01Z service=api requestId=req-500 retry checkout\n    at submitCheckout (/srv/checkout.js:44:9)"
+    }
+  ],
+  "clarifyingAnswers": [],
+  "expected": {
+    "confidence": "likely",
+    "nextActionMode": "fix",
+    "draftType": "fix",
+    "shouldAskQuestion": false,
+    "riskyContradiction": false,
+    "majorClaimKeywords": ["api", "submitcheckout", "checkout"]
+  }
+}

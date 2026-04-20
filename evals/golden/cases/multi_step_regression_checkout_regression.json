@@ -1,0 +1,29 @@
+{
+  "id": "multi_step_regression_checkout_regression",
+  "category": "multi_step_regression",
+  "title": "Checkout regression after a release chain",
+  "userProblemStatement": "Checkout worked before the latest release chain and now fails after multiple steps.",
+  "evidence": [
+    {
+      "kind": "log",
+      "source": "paste",
+      "originalName": "api-regression-log",
+      "rawText": "2026-04-09T00:00:00Z service=api requestId=req-800 GET /api/checkout\nError: regression failed\n    at submitCheckout (/srv/checkout.js:44:9)"
+    },
+    {
+      "kind": "note",
+      "source": "manual_note",
+      "originalName": "release-note",
+      "rawText": "The issue started after the release that changed checkout validation and async job retry behavior."
+    }
+  ],
+  "clarifyingAnswers": [],
+  "expected": {
+    "confidence": "plausible",
+    "nextActionMode": "verify",
+    "draftType": "investigation",
+    "shouldAskQuestion": false,
+    "riskyContradiction": false,
+    "majorClaimKeywords": ["checkout", "regression", "api"]
+  }
+}

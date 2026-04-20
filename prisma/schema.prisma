@@ -1,0 +1,423 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+enum WorkspaceMembershipRole {
+  OWNER
+  MEMBER
+}
+
+enum CaseSolveMode {
+  QUICK_PATCH
+  PROPER_FIX
+  STRATEGIC_IMPROVEMENT
+}
+
+/// Optional user override; null means auto-detect at planning time.
+enum CaseProblemLens {
+  CODE
+  UX_UI
+  PRODUCT
+  DOCTRINE
+  MIXED
+}
+
+enum CaseWorkflowState {
+  INTAKE
+  ACTIVE
+  RESOLVED
+}
+
+enum CaseAnalysisState {
+  NOT_STARTED
+  ANALYZING
+  NEEDS_INPUT
+  READY
+  FAILED
+}
+
+enum CaseDraftState {
+  NOT_STARTED
+  READY
+}
+
+enum CaseSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum CaseConfidence {
+  LIKELY
+  PLAUSIBLE
+  UNCLEAR
+}
+
+enum EvidenceKind {
+  LOG
+  SCREENSHOT
+  ERROR_TEXT
+  TERMINAL
+  NOTE
+  CODE
+}
+
+enum EvidenceSource {
+  UPLOAD
+  PASTE
+  MANUAL_NOTE
+}
+
+enum EvidenceIngestStatus {
+  PARSING
+  READY
+  NEEDS_REVIEW
+  UNSUPPORTED
+  FAILED
+}
+
+enum AnalysisRunStatus {
+  ANALYZING
+  NEEDS_INPUT
+  READY
+  FAILED
+}
+
+enum DiagnosisNextActionMode {
+  FIX
+  VERIFY
+  REQUEST_INPUT
+}
+
+enum ClaimReferenceRelation {
+  SUPPORTS
+  WEAKENS
+  UNCLEAR
+}
+
+enum ActionDraftType {
+  FIX
+  INVESTIGATION
+}
+
+enum ActionDraftStatus {
+  DRAFTED
+  SAVED
+  SENT
+  DISMISSED
+}
+
+/// Breakdown / bundle lifecycle on the case (pointers only; not a task tracker).
+enum CaseBreakdownState {
+  NOT_STARTED
+  READY
+}
+
+enum CaseWorkBundleState {
+  NOT_STARTED
+  READY
+}
+
+/// Packaging state: generated snapshot vs user-dismissed in UI (no execution states).
+enum WorkBundleStatus {
+  GENERATED
+  DISMISSED
+}
+
+model User {
+  id           String                @id @default(cuid())
+  email        String                @unique
+  passwordHash String
+  name         String?
+  createdAt    DateTime              @default(now())
+  updatedAt    DateTime              @updatedAt
+  memberships  WorkspaceMembership[]
+  createdCases TargCase[]            @relation("CasesCreatedByUser")
+  analysisRuns TargAnalysisRun[]     @relation("AnalysisRunsCreatedByUser")
+}
+
+model Workspace {
+  id                String                @id @default(cuid())
+  name              String
+  personalForUserId String?               @unique
+  playbookConfig    Json?
+  playbookConfiguredAt DateTime?
+  createdAt         DateTime              @default(now())
+  updatedAt         DateTime              @updatedAt
+  memberships       WorkspaceMembership[]
+  cases             TargCase[]
+}
+
+model WorkspaceMembership {
+  id          String                  @id @default(cuid())
+  workspaceId String
+  userId      String
+  role        WorkspaceMembershipRole @default(OWNER)
+  createdAt   DateTime                @default(now())
+  updatedAt   DateTime                @updatedAt
+  workspace   Workspace               @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user        User                    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, userId])
+  @@index([userId])
+}
+
+model TargCase {
+  id                   String            @id @default(cuid())
+  workspaceId          String
+  title                String
+  createdByUserId      String
+  workflowState        CaseWorkflowState
+  analysisState        CaseAnalysisState
+  draftState           CaseDraftState
+  breakdownState       CaseBreakdownState   @default(NOT_STARTED)
+  workBundleState      CaseWorkBundleState  @default(NOT_STARTED)
+  userProblemStatement String
+  /// Optional: shapes bundle depth and fix vs investigate bias.
+  solveMode            CaseSolveMode?
+  /// Optional override for classification; null = infer from text + evidence.
+  problemLens          CaseProblemLens?
+  severity             CaseSeverity?
+  confidence           CaseConfidence?
+  latestDiagnosisId    String?
+  latestDraftId        String?
+  latestBreakdownId    String?
+  latestWorkBundleId   String?
+  evidenceVersion      Int               @default(1)
+  createdAt            DateTime          @default(now())
+  updatedAt            DateTime          @updatedAt
+  resolvedAt           DateTime?
+  workspace            Workspace         @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  createdByUser        User              @relation("CasesCreatedByUser", fields: [createdByUserId], references: [id], onDelete: Cascade)
+  evidence             TargEvidence[]
+  analysisRuns         TargAnalysisRun[]
+  diagnosisSnapshots   TargDiagnosisSnapshot[]
+  actionDrafts         TargActionDraft[]
+  breakdowns           TargBreakdown[]
+  workBundles          TargWorkBundle[]
+  handoffs             TargHandoff[]
+
+  @@index([workspaceId, createdAt(sort: Desc)])
+  @@index([latestBreakdownId])
+  @@index([latestWorkBundleId])
+  @@index([createdByUserId])
+}
+
+model TargEvidence {
+  id                  String               @id @default(cuid())
+  caseId              String
+  kind                EvidenceKind
+  source              EvidenceSource
+  ingestStatus        EvidenceIngestStatus @default(PARSING)
+  originalName        String
+  mimeType            String?
+  rawStorageUrl       String?
+  rawText             String?
+  redactedText        String?
+  extracted           Json?
+  caseEvidenceVersion Int                  @default(1)
+  createdAt           DateTime             @default(now())
+  case                TargCase             @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  claimReferences     TargClaimReference[]
+
+  @@index([caseId, createdAt(sort: Desc)])
+  @@index([ingestStatus])
+}
+
+model TargAnalysisRun {
+  id                 String            @id @default(cuid())
+  caseId             String
+  createdByUserId    String
+  status             AnalysisRunStatus @default(ANALYZING)
+  questionCount      Int               @default(0)
+  pendingQuestion    String?
+  pendingOptions     Json?
+  answers            Json?
+  caseMemory         Json?
+  failureMessage     String?
+  latestDiagnosisId  String?
+  completedAt        DateTime?
+  createdAt          DateTime          @default(now())
+  updatedAt          DateTime          @updatedAt
+  case               TargCase          @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  createdByUser      User              @relation("AnalysisRunsCreatedByUser", fields: [createdByUserId], references: [id], onDelete: Cascade)
+  diagnosisSnapshots TargDiagnosisSnapshot[]
+
+  @@index([caseId, createdAt(sort: Desc)])
+  @@index([createdByUserId])
+  @@index([status])
+}
+
+model TargDiagnosisSnapshot {
+  id                 String                   @id @default(cuid())
+  caseId             String
+  analysisRunId      String
+  caseEvidenceVersion Int
+  status             String
+  confidence         CaseConfidence
+  /// User-facing problem framing (scope, restatement). Append-only with snapshot.
+  problemBrief       Json?
+  probableRootCause  String
+  affectedArea       String
+  summary            String
+  trace              Json
+  hypotheses         Json
+  contradictions     Json
+  missingEvidence    Json
+  nextActionMode     DiagnosisNextActionMode
+  nextActionText     String
+  claimReferences    Json
+  createdAt          DateTime                 @default(now())
+  case               TargCase                 @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  analysisRun        TargAnalysisRun          @relation(fields: [analysisRunId], references: [id], onDelete: Cascade)
+  claimReferenceRows TargClaimReference[]
+  actionDrafts       TargActionDraft[]
+  breakdowns         TargBreakdown[]
+  workBundles        TargWorkBundle[]
+
+  @@index([caseId, createdAt(sort: Desc)])
+  @@index([analysisRunId])
+}
+
+model TargClaimReference {
+  id                  String                 @id @default(cuid())
+  diagnosisSnapshotId String
+  claimKey            String
+  claimText           String
+  relation            ClaimReferenceRelation
+  sourceLabel         String?
+  summary             String?
+  excerptText         String?
+  evidenceId          String?
+  createdAt           DateTime               @default(now())
+  diagnosisSnapshot   TargDiagnosisSnapshot  @relation(fields: [diagnosisSnapshotId], references: [id], onDelete: Cascade)
+  evidence            TargEvidence?          @relation(fields: [evidenceId], references: [id], onDelete: SetNull)
+
+  @@index([diagnosisSnapshotId, claimKey])
+  @@index([evidenceId])
+}
+
+/// Structured decomposition for a single diagnosis revision (append-only).
+/// JSON fields follow `src/lib/planning/bundle-types.ts` (Targ-native schema).
+model TargBreakdown {
+  id                   String                @id @default(cuid())
+  caseId               String
+  diagnosisSnapshotId  String
+  caseEvidenceVersion  Int
+  schemaVersion        Int                   @default(1)
+  /// Problem taxonomy + facets (optional until classifier runs).
+  problemClassification Json?
+  /// Shared spine: observed signal, boundaries, evidence index, decision stub, etc.
+  sharedSpine          Json
+  /// Mode-specific extension blocks (functional, experience, …).
+  modeExtensions       Json
+  /// Ranked hypotheses with keys stable for bundle task linking.
+  rankedHypotheses     Json
+  /// Open questions / falsification criteria not yet closed.
+  unknowns             Json
+  /// Cross-artifact deps (e.g. hypothesis H2 depends on evidence E1).
+  artifactDependencies Json
+  /// Anchors to TargEvidence ids + semantic roles for bundle tasks.
+  evidenceAnchors      Json
+  /// Snapshot of diagnosis confidence at generation time (lineage).
+  inheritedConfidence  CaseConfidence?
+  createdAt            DateTime              @default(now())
+  case                 TargCase              @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  diagnosisSnapshot    TargDiagnosisSnapshot @relation(fields: [diagnosisSnapshotId], references: [id], onDelete: Cascade)
+  workBundles          TargWorkBundle[]
+
+  @@index([caseId, createdAt(sort: Desc)])
+  @@index([diagnosisSnapshotId])
+}
+
+/// Packaged work proposal from a breakdown (append-only; export/handoff, not execution).
+model TargWorkBundle {
+  id                  String                @id @default(cuid())
+  caseId              String
+  diagnosisSnapshotId String
+  breakdownId         String
+  schemaVersion       Int                   @default(1)
+  label               String?
+  /// Full bundle: task groups, tasks, carried unknowns, confidence summary, evidence links.
+  payload             Json
+  status              WorkBundleStatus      @default(GENERATED)
+  createdAt           DateTime              @default(now())
+  case                TargCase              @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  diagnosisSnapshot   TargDiagnosisSnapshot @relation(fields: [diagnosisSnapshotId], references: [id], onDelete: Cascade)
+  breakdown           TargBreakdown         @relation(fields: [breakdownId], references: [id], onDelete: Cascade)
+
+  @@index([caseId, createdAt(sort: Desc)])
+  @@index([diagnosisSnapshotId])
+  @@index([breakdownId])
+}
+
+model TargActionDraft {
+  id                  String            @id @default(cuid())
+  caseId              String
+  diagnosisSnapshotId String
+  type                ActionDraftType
+  title               String
+  summary             String
+  whyNow              String
+  urgency             String
+  suggestedSteps      Json
+  risksOrUnknowns     Json?
+  linkedEvidenceIds   Json
+  status              ActionDraftStatus @default(DRAFTED)
+  createdAt           DateTime          @default(now())
+  updatedAt           DateTime          @updatedAt
+  savedAt             DateTime?
+  case                TargCase          @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  diagnosisSnapshot   TargDiagnosisSnapshot @relation(fields: [diagnosisSnapshotId], references: [id], onDelete: Cascade)
+
+  @@index([caseId, createdAt(sort: Desc)])
+  @@index([diagnosisSnapshotId])
+  @@index([status])
+}
+
+/// A rendered Handoff Packet sent to an external receiver (Cursor, Claude Code,
+/// Codex, GitHub, Linear, Markdown). Append-only; one row per button click.
+///
+/// Source of truth for the packet shape: docs/handoff-packet.md
+enum HandoffTarget {
+  CURSOR
+  CLAUDE_CODE
+  CODEX
+  COPILOT_WS
+  GITHUB_ISSUE
+  LINEAR_ISSUE
+  MARKDOWN
+}
+
+model TargHandoff {
+  id            String        @id @default(cuid())
+  caseId        String
+  diagnosisId   String?
+  workBundleId  String?
+  target        HandoffTarget
+  /// Rendered Markdown actually delivered to the target (post-truncation).
+  packetMd      String
+  /// Structured HandoffPacket object that produced `packetMd`; keep for replay.
+  packetJson    Json
+  /// URL / issue number / PR url returned by the target, when applicable.
+  externalRef   String?
+  /// Truncation steps that ran before rendering, for debugging packet size.
+  truncationSteps Json?
+  createdByUserId String
+  createdAt     DateTime      @default(now())
+  case          TargCase      @relation(fields: [caseId], references: [id], onDelete: Cascade)
+
+  @@index([caseId, createdAt(sort: Desc)])
+  @@index([target])
+  @@index([createdByUserId])
+}

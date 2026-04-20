@@ -1,0 +1,198 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`handoff packet — contradiction_split_service_failure fixture > renders the canonical markdown with the locked shape > canonical-markdown.md 1`] = `
+"# API and worker evidence disagree on the failing boundary
+
+Checkout failures look split across the API and worker layers.
+
+_Case: [c_contra01](https://targ.app/cases/c_contra01) · generated 2026-04-20T14:45:02.000Z_
+
+## Best current read
+
+Two independent failure signals are surfacing — one in the API request path (submitCheckout) and one
+in the worker loop (runWorker) — and the current evidence does not show which one is causing the
+other.
+
+**Confidence:** low. The API log and the worker log describe failures at different frames with no
+shared request identifier to tie them together.
+
+**Affected area:** checkout flow across the API and worker layers
+
+## Evidence
+
+1. **api-log** (log, paste)
+   A GET /api/checkout request produced a 500 at submitCheckout line 44, with request id req-600.
+   \`\`\`
+   2026-04-09T00:00:00Z service=api requestId=req-600 GET /api/checkout
+   Error: failed
+    at submitCheckout (/srv/checkout.js:44:9)
+   \`\`\`
+
+2. **worker-log** (terminal, paste)
+   A worker retry loop failed at runWorker line 12. No timestamp or request id is attached, so it is
+   not clear whether it corresponds to the same request above.
+   \`\`\`
+   service=worker
+   retry loop failed
+    at runWorker (/srv/worker.js:12:2)
+   \`\`\`
+
+## Hypotheses
+
+1. **The worker retry loop is the cause; the API 500 is a downstream symptom** — confidence: medium
+   If the worker is failing to process a payment-related job, submitCheckout could fall through to a
+   500 when it reads an empty or errored worker result.
+   Supports: #2, #1
+
+2. **The API failure is the cause; the worker failure is unrelated** — confidence: low
+   submitCheckout throws before the worker is ever invoked for this request, and the worker log is from
+   a separate job. The two logs are co-occurring by chance.
+   Supports: #2
+   Weakened by: #1
+
+3. **Both are symptoms of a shared dependency failure (upstream provider or config)** — confidence: low
+   Neither log contains env hints, provider names, or config values, so a common dependency outage
+   cannot be ruled out without more signal.
+
+## Open questions
+
+- Can you share a worker log entry containing req-600, so the two failures can be tied together or
+  separated?
+- Whether there was a deploy, config change, or provider incident in the last 24 hours that touched
+  both the API and the worker?
+- Can you share a submitCheckout trace showing whether it depends on the worker path synchronously or
+  not?
+
+## Next step
+
+**collect_evidence:** Add one piece of evidence that either ties the two failures together or
+clearly separates them: either a worker log entry containing req-600, or a submitCheckout trace
+showing whether it depends on the worker path.
+
+**Done when:**
+- The packet contains the evidence described above: A worker log entry containing req-600, so the two
+  failures can be tied together or separated.
+- The new evidence resolves or clearly isolates: The API log and the worker log describe failures at
+  different frames with no shared request identifier to tie them together.
+- A follow-up diagnosis reaches medium confidence or higher.
+"
+`;
+
+exports[`handoff packet — contradiction_split_service_failure fixture > renders the structured packet shape deterministically > packet.json 1`] = `
+{
+  "evidence": [
+    {
+      "excerpt": "2026-04-09T00:00:00Z service=api requestId=req-600 GET /api/checkout
+Error: failed
+ at submitCheckout (/srv/checkout.js:44:9)",
+      "extracted": {
+        "endpoints": [
+          "GET /api/checkout",
+        ],
+        "requestIds": [
+          "req-600",
+        ],
+        "services": [
+          "api",
+        ],
+        "stackFrames": [
+          "at submitCheckout (/srv/checkout.js:44:9)",
+        ],
+        "timestamps": [
+          "2026-04-09T00:00:00Z",
+        ],
+      },
+      "id": "ev_api_log",
+      "kind": "log",
+      "name": "api-log",
+      "source": "paste",
+      "summary": "A GET /api/checkout request produced a 500 at submitCheckout line 44, with request id req-600.",
+    },
+    {
+      "excerpt": "service=worker
+retry loop failed
+ at runWorker (/srv/worker.js:12:2)",
+      "extracted": {
+        "services": [
+          "worker",
+        ],
+        "stackFrames": [
+          "at runWorker (/srv/worker.js:12:2)",
+        ],
+      },
+      "id": "ev_worker_log",
+      "kind": "terminal",
+      "name": "worker-log",
+      "source": "paste",
+      "summary": "A worker retry loop failed at runWorker line 12. No timestamp or request id is attached, so it is not clear whether it corresponds to the same request above.",
+    },
+  ],
+  "format": "targ.handoff",
+  "hypotheses": [
+    {
+      "confidence": "medium",
+      "reasoning": "If the worker is failing to process a payment-related job, submitCheckout could fall through to a 500 when it reads an empty or errored worker result.",
+      "supportingEvidenceIds": [
+        "ev_worker_log",
+        "ev_api_log",
+      ],
+      "title": "The worker retry loop is the cause; the API 500 is a downstream symptom",
+    },
+    {
+      "confidence": "low",
+      "reasoning": "submitCheckout throws before the worker is ever invoked for this request, and the worker log is from a separate job. The two logs are co-occurring by chance.",
+      "supportingEvidenceIds": [
+        "ev_worker_log",
+      ],
+      "title": "The API failure is the cause; the worker failure is unrelated",
+      "weakenedByEvidenceIds": [
+        "ev_api_log",
+      ],
+    },
+    {
+      "confidence": "low",
+      "reasoning": "Neither log contains env hints, provider names, or config values, so a common dependency outage cannot be ruled out without more signal.",
+      "supportingEvidenceIds": [],
+      "title": "Both are symptoms of a shared dependency failure (upstream provider or config)",
+    },
+  ],
+  "meta": {
+    "caseId": "c_contra01",
+    "caseUrl": "https://targ.app/cases/c_contra01",
+    "generatedAt": "2026-04-20T14:45:02.000Z",
+    "generatorVersion": "targ-handoff/1.0.0",
+  },
+  "nextStep": {
+    "acceptanceCriteria": [
+      "The packet contains the evidence described above: A worker log entry containing req-600, so the two failures can be tied together or separated.",
+      "The new evidence resolves or clearly isolates: The API log and the worker log describe failures at different frames with no shared request identifier to tie them together.",
+      "A follow-up diagnosis reaches medium confidence or higher.",
+    ],
+    "instruction": "Add one piece of evidence that either ties the two failures together or clearly separates them: either a worker log entry containing req-600, or a submitCheckout trace showing whether it depends on the worker path.",
+    "mode": "collect_evidence",
+  },
+  "openQuestions": [
+    "Can you share a worker log entry containing req-600, so the two failures can be tied together or separated?",
+    "Whether there was a deploy, config change, or provider incident in the last 24 hours that touched both the API and the worker?",
+    "Can you share a submitCheckout trace showing whether it depends on the worker path synchronously or not?",
+  ],
+  "policy": {
+    "evidenceBasedOnly": true,
+    "mayCommit": false,
+    "mayOpenPr": false,
+  },
+  "problem": {
+    "statement": "Checkout failures look split across the API and worker layers.",
+    "title": "API and worker evidence disagree on the failing boundary",
+  },
+  "read": {
+    "affectedArea": {
+      "label": "checkout flow across the API and worker layers",
+    },
+    "confidence": "low",
+    "confidenceNote": "The API log and the worker log describe failures at different frames with no shared request identifier to tie them together.",
+    "headline": "Two independent failure signals are surfacing — one in the API request path (submitCheckout) and one in the worker loop (runWorker) — and the current evidence does not show which one is causing the other.",
+  },
+  "schemaVersion": 1,
+}
+`;
