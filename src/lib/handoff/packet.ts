@@ -102,6 +102,13 @@ export type HandoffEvidenceItem = {
     requestIds?: string[];
     stackFrames?: string[];
   };
+  /// Repo references derived for this evidence item by the enrichment layer
+  /// (Phase 2.3). Only populated when the case is scoped to a repo and at
+  /// least one hint resolved to a real file in the current snapshot. Callers
+  /// that don't care about repo context can ignore this field entirely —
+  /// the Markdown renderer only emits it when the enclosing packet has
+  /// `repoContext.repoFullName` + `repoContext.ref` available.
+  repoLocations?: RepoLocation[];
 };
 
 export type HandoffHypothesis = {
@@ -163,13 +170,44 @@ export type HandoffPacketInput = {
   };
   diagnosis: DiagnosisSnapshotViewModel;
   evidence: EvidenceViewModel[];
+  /// Manually-supplied repo context (e.g. CLI-driven runs where the caller
+  /// already knows the commit SHA + stack locations). Mutually exclusive with
+  /// `repoEnrichment`: if both are supplied, `repoEnrichment` wins.
   repoContext?: HandoffPacket["repoContext"];
+  /// Structured enrichment produced by the Phase 2.3 enrichment layer. When
+  /// present, the builder uses it to populate `read.affectedArea.repoLocation`,
+  /// `repoContext.stackLocations`, and per-evidence `repoLocations`.
+  repoEnrichment?: RepoEnrichmentInput;
   priors?: PriorCase[];
   generator: {
     caseUrl: string;
     generatorVersion: string;
     now?: Date;
   };
+};
+
+/// Shape consumed by `buildHandoffPacket` to enrich a packet with resolver-
+/// verified repo references. Produced by `handoff-enrichment-service` at
+/// request time. All fields except `repoFullName` + `ref` are optional — a
+/// case whose evidence doesn't match anything in the current snapshot still
+/// gets a packet, it just carries `repoContext.{repoFullName, ref}` and no
+/// inline locations.
+export type RepoEnrichmentInput = {
+  /// `owner/repo` for rendering GitHub blob URLs.
+  repoFullName: string;
+  /// Commit SHA the snapshot is pinned to. MUST be a real SHA (40-hex for
+  /// GitHub) so packet consumers can treat `owner/repo@ref/path#L42` as
+  /// reproducible.
+  ref: string;
+  /// Resolved locations per evidence id. Evidence ids not present in this
+  /// map simply don't get `repoLocations` populated.
+  evidenceLocations?: Record<string, RepoLocation[]>;
+  /// Best single resolved location for the diagnosis's affected area, if any.
+  affectedAreaLocation?: RepoLocation;
+  /// Aggregated stack-trace locations surfaced at the top of `repoContext`.
+  /// Distinct from per-evidence locations: these are "the code worth reading
+  /// first", typically derived from parsed stack frames.
+  stackLocations?: RepoLocation[];
 };
 
 // ---------------------------------------------------------------------------
@@ -345,7 +383,8 @@ function extractStackFrameLines(
 }
 
 function buildEvidenceItem(
-  evidence: EvidenceViewModel
+  evidence: EvidenceViewModel,
+  repoLocations?: RepoLocation[]
 ): HandoffEvidenceItem {
   const extracted = evidence.extracted ?? null;
   const item: HandoffEvidenceItem = {
@@ -355,6 +394,10 @@ function buildEvidenceItem(
     name: evidence.originalName,
     summary: clip(evidence.summary ?? `${evidence.kind} evidence`, SUMMARY_LIMIT),
   };
+
+  if (repoLocations && repoLocations.length > 0) {
+    item.repoLocations = repoLocations;
+  }
 
   const excerpt = pickEvidenceExcerpt(evidence);
   if (excerpt) item.excerpt = excerpt;
@@ -582,7 +625,11 @@ export function buildHandoffPacket(input: HandoffPacketInput): HandoffPacket {
     input.diagnosis.nextActionMode
   );
 
-  const builtEvidence = input.evidence.map(buildEvidenceItem);
+  const enrichment = input.repoEnrichment;
+  const evidenceLocationMap = enrichment?.evidenceLocations ?? {};
+  const builtEvidence = input.evidence.map((item) =>
+    buildEvidenceItem(item, evidenceLocationMap[item.id])
+  );
   const hypotheses = input.diagnosis.hypotheses
     .slice(0, 3)
     .map((h) => buildHypothesis(h, input.diagnosis.claimReferences, input.evidence));
@@ -631,6 +678,9 @@ export function buildHandoffPacket(input: HandoffPacketInput): HandoffPacket {
         : {}),
       affectedArea: {
         label: clip(input.diagnosis.affectedArea, 180),
+        ...(enrichment?.affectedAreaLocation
+          ? { repoLocation: enrichment.affectedAreaLocation }
+          : {}),
       },
     },
 
@@ -649,7 +699,23 @@ export function buildHandoffPacket(input: HandoffPacketInput): HandoffPacket {
       }),
     },
 
-    ...(input.repoContext ? { repoContext: input.repoContext } : {}),
+    ...(() => {
+      if (enrichment) {
+        const ctx: HandoffPacket["repoContext"] = {
+          repoFullName: enrichment.repoFullName,
+          ref: enrichment.ref,
+          ...(enrichment.stackLocations && enrichment.stackLocations.length > 0
+            ? { stackLocations: enrichment.stackLocations }
+            : {}),
+          ...(input.repoContext?.suspectedRegressions
+            ? { suspectedRegressions: input.repoContext.suspectedRegressions }
+            : {}),
+        };
+        return { repoContext: ctx };
+      }
+      if (input.repoContext) return { repoContext: input.repoContext };
+      return {};
+    })(),
     ...(input.priors && input.priors.length > 0 ? { priors: input.priors } : {}),
 
     policy: {
@@ -789,5 +855,55 @@ export function assertPacketValid(
       "case_url_absolute",
       `meta.caseUrl must be absolute; got "${packet.meta.caseUrl}".`
     );
+  }
+
+  // Invariant 8: every repo location points at a non-empty path; if `line` is
+  // provided it must be a positive integer. Enrichment bugs that produce
+  // `{ file: "", line: NaN }` should surface here rather than at render time.
+  const allLocations: RepoLocation[] = [
+    ...(packet.read.affectedArea.repoLocation
+      ? [packet.read.affectedArea.repoLocation]
+      : []),
+    ...(packet.repoContext?.stackLocations ?? []),
+    ...packet.evidence.flatMap((item) => item.repoLocations ?? []),
+  ];
+  for (const location of allLocations) {
+    if (typeof location.file !== "string" || location.file.trim().length === 0) {
+      throw new HandoffPacketInvariantError(
+        "repo_location_file_required",
+        "Every RepoLocation must have a non-empty `file` path."
+      );
+    }
+    if (
+      location.line !== undefined &&
+      (!Number.isInteger(location.line) || location.line <= 0)
+    ) {
+      throw new HandoffPacketInvariantError(
+        "repo_location_line_positive",
+        `RepoLocation.line must be a positive integer; got ${JSON.stringify(location.line)}.`
+      );
+    }
+  }
+
+  // Invariant 9: if repoContext exists with a ref, it must be a plausible git
+  // ref (SHA, branch, or tag). We accept anything non-empty that isn't obvious
+  // garbage to keep the door open for future "branch head" packets.
+  if (packet.repoContext) {
+    const ref = packet.repoContext.ref;
+    if (typeof ref !== "string" || ref.trim().length === 0) {
+      throw new HandoffPacketInvariantError(
+        "repo_context_ref_required",
+        "repoContext.ref must be a non-empty string when repoContext is set."
+      );
+    }
+    if (
+      typeof packet.repoContext.repoFullName !== "string" ||
+      !packet.repoContext.repoFullName.includes("/")
+    ) {
+      throw new HandoffPacketInvariantError(
+        "repo_context_name_required",
+        `repoContext.repoFullName must look like "owner/repo"; got "${packet.repoContext.repoFullName}".`
+      );
+    }
   }
 }
