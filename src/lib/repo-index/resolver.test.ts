@@ -1,6 +1,65 @@
 import { describe, expect, it } from "vitest";
 
-import { resolvePath, tokenize, type ResolverInputFile } from "./resolver";
+import {
+  resolvePath,
+  resolveSymbol,
+  tokenize,
+  type ResolverInputFile,
+  type ResolverInputSymbol,
+} from "./resolver";
+
+const SYMBOLS: ReadonlyArray<ResolverInputSymbol> = [
+  {
+    name: "processPayment",
+    kind: "FUNCTION",
+    line: 42,
+    endLine: 60,
+    exported: true,
+    filePath: "src/lib/billing/payment.ts",
+    fileKind: "CODE",
+    fileLanguage: "typescript",
+  },
+  {
+    name: "processPayment",
+    kind: "FUNCTION",
+    line: 12,
+    endLine: 20,
+    exported: false,
+    filePath: "src/lib/billing/payment.test.ts",
+    fileKind: "TEST",
+    fileLanguage: "typescript",
+  },
+  {
+    name: "CheckoutService",
+    kind: "CLASS",
+    line: 10,
+    endLine: 200,
+    exported: true,
+    filePath: "src/lib/checkout/checkout-service.ts",
+    fileKind: "CODE",
+    fileLanguage: "typescript",
+  },
+  {
+    name: "useCheckout",
+    kind: "FUNCTION",
+    line: 5,
+    endLine: 30,
+    exported: true,
+    filePath: "src/lib/checkout/use-checkout.ts",
+    fileKind: "CODE",
+    fileLanguage: "typescript",
+  },
+  {
+    name: "Button",
+    kind: "COMPONENT",
+    line: 3,
+    endLine: 25,
+    exported: true,
+    filePath: "src/components/ui/button.tsx",
+    fileKind: "CODE",
+    fileLanguage: "typescript",
+  },
+];
 
 const FILES: ReadonlyArray<ResolverInputFile> = [
   { path: "src/lib/checkout/checkout-service.ts", kind: "CODE", language: "typescript" },
@@ -116,6 +175,11 @@ describe("resolvePath", () => {
     expect(result[0]?.path).toBe("src/logo.ts");
   });
 
+  it("includes low-score token-overlap hits when minScore is forgiving", () => {
+    const result = resolvePath("checkout", FILES, { minScore: 0.05 });
+    expect(result.length).toBeGreaterThan(0);
+  });
+
   it("sorts by path length as a tie-breaker when scores tie", () => {
     const tied: ResolverInputFile[] = [
       { path: "a/b/c/foo.ts", kind: "CODE", language: "typescript" },
@@ -123,5 +187,78 @@ describe("resolvePath", () => {
     ];
     const result = resolvePath("foo.ts", tied);
     expect(result[0]?.path).toBe("foo.ts");
+  });
+});
+
+describe("resolveSymbol", () => {
+  it("returns [] for empty query", () => {
+    expect(resolveSymbol("", SYMBOLS)).toEqual([]);
+    expect(resolveSymbol("   ", SYMBOLS)).toEqual([]);
+  });
+
+  it("ranks exact name matches highest, preferring non-test files", () => {
+    const result = resolveSymbol("processPayment", SYMBOLS);
+    expect(result[0]).toMatchObject({
+      name: "processPayment",
+      filePath: "src/lib/billing/payment.ts",
+    });
+    // Test-file hit should rank below.
+    const testHit = result.find(
+      (r) => r.filePath === "src/lib/billing/payment.test.ts"
+    );
+    if (testHit) {
+      expect(testHit.score).toBeLessThan(result[0]!.score);
+    }
+  });
+
+  it("case-insensitive exact match", () => {
+    const result = resolveSymbol("CHECKOUTSERVICE", SYMBOLS);
+    expect(result[0]?.name).toBe("CheckoutService");
+  });
+
+  it("substring match for partial queries", () => {
+    const result = resolveSymbol("Payment", SYMBOLS);
+    // "Payment" is a substring of "processPayment" — both should match.
+    expect(result.some((r) => r.name === "processPayment")).toBe(true);
+  });
+
+  it("filters by symbol kind when requested", () => {
+    const result = resolveSymbol("Button", SYMBOLS, {
+      kinds: ["COMPONENT"],
+    });
+    expect(result.length).toBe(1);
+    expect(result[0]?.kind).toBe("COMPONENT");
+  });
+
+  it("returns [] when nothing matches", () => {
+    const result = resolveSymbol("unrelatedFunction", SYMBOLS);
+    expect(result).toEqual([]);
+  });
+
+  it("gives exported symbols a small boost", () => {
+    const mixed: ResolverInputSymbol[] = [
+      {
+        name: "foo",
+        kind: "FUNCTION",
+        line: 1,
+        endLine: 5,
+        exported: true,
+        filePath: "src/a.ts",
+        fileKind: "CODE",
+        fileLanguage: "typescript",
+      },
+      {
+        name: "foo",
+        kind: "FUNCTION",
+        line: 1,
+        endLine: 5,
+        exported: false,
+        filePath: "src/b.ts",
+        fileKind: "CODE",
+        fileLanguage: "typescript",
+      },
+    ];
+    const result = resolveSymbol("foo", mixed);
+    expect(result[0]?.exported).toBe(true);
   });
 });

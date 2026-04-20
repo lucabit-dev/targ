@@ -227,6 +227,31 @@ export type GithubTreeResult = {
   entries: GithubTreeEntry[];
 };
 
+/// Fetches raw blob content by SHA. GitHub's blob API returns a base64 or
+/// UTF-8 payload depending on encoding; we always decode to a UTF-8 string
+/// and treat binary content as an empty string (callers should pre-filter
+/// blobs by file kind).
+export async function getBlobContent(
+  token: string,
+  owner: string,
+  name: string,
+  blobSha: string
+): Promise<string> {
+  const response = await githubFetch(
+    `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/git/blobs/${encodeURIComponent(blobSha)}`,
+    { token }
+  );
+  const payload = (await response.json()) as {
+    content: string;
+    encoding: string;
+  };
+  if (payload.encoding === "base64") {
+    const buf = Buffer.from(payload.content, "base64");
+    return buf.toString("utf8");
+  }
+  return payload.content ?? "";
+}
+
 /// Recursive tree read for a commit. GitHub returns up to ~100k entries in a
 /// single call; anything beyond that sets `truncated: true` and the caller
 /// must treat the snapshot as PARTIAL.

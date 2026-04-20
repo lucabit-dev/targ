@@ -17,7 +17,7 @@
 /// should treat scores < 0.35 as low-confidence matches and prefer to surface
 /// multiple candidates.
 
-import type { RepoFileKind } from "@prisma/client";
+import type { RepoFileKind, RepoSymbolKind } from "@prisma/client";
 
 export type ResolverInputFile = {
   path: string;
@@ -269,6 +269,159 @@ export function resolvePath(
     if (b.score !== a.score) return b.score - a.score;
     if (a.path.length !== b.path.length) return a.path.length - b.path.length;
     return a.path < b.path ? -1 : a.path > b.path ? 1 : 0;
+  });
+
+  return scored.slice(0, limit);
+}
+
+export type ResolverInputSymbol = {
+  name: string;
+  kind: RepoSymbolKind;
+  line: number;
+  endLine: number | null;
+  exported: boolean;
+  filePath: string;
+  fileKind: RepoFileKind;
+  fileLanguage: string | null;
+};
+
+export type ResolvedSymbolCandidate = {
+  name: string;
+  kind: RepoSymbolKind;
+  line: number;
+  endLine: number | null;
+  exported: boolean;
+  filePath: string;
+  fileKind: RepoFileKind;
+  fileLanguage: string | null;
+  score: number;
+  reasons: string[];
+};
+
+export type ResolveSymbolOptions = {
+  /// Maximum candidates to return. Default 5.
+  limit?: number;
+  /// Minimum score required to survive. Default 0.2.
+  minScore?: number;
+  /// Filter to specific symbol kinds.
+  kinds?: ReadonlyArray<RepoSymbolKind>;
+  /// When true, prefer exported symbols over internal helpers. Default true.
+  preferExported?: boolean;
+  /// When true, penalize symbols defined in TEST files unless the query
+  /// itself looks test-related. Default true.
+  biasAwayFromTests?: boolean;
+};
+
+/// Ranks symbols against a query. Matching strategies:
+///   - Exact name (case-sensitive)         -> 1.0
+///   - Exact name (case-insensitive)       -> 0.9
+///   - Query is a token of the symbol      -> 0.6
+///   - Symbol is a token of the query      -> 0.5
+///   - Substring match                     -> 0.4
+/// Modifiers: +0.1 for exported, test-file penalty per fileKind.
+export function resolveSymbol(
+  query: string,
+  symbols: ReadonlyArray<ResolverInputSymbol>,
+  options: ResolveSymbolOptions = {}
+): ResolvedSymbolCandidate[] {
+  const limit = options.limit ?? 5;
+  const minScore = options.minScore ?? 0.2;
+  const preferExported = options.preferExported ?? true;
+  const biasAwayFromTests = options.biasAwayFromTests ?? true;
+  const kindsFilter = options.kinds ? new Set(options.kinds) : null;
+
+  const trimmed = query.trim();
+  if (!trimmed) return [];
+
+  const lower = trimmed.toLowerCase();
+  const queryTokens = new Set(tokenize(trimmed));
+  const hintIsTesty = hintLooksLikeTest(trimmed);
+
+  const scored: ResolvedSymbolCandidate[] = [];
+
+  for (const sym of symbols) {
+    if (kindsFilter && !kindsFilter.has(sym.kind)) continue;
+
+    let score = 0;
+    const reasons: string[] = [];
+
+    if (sym.name === trimmed) {
+      score = 1;
+      reasons.push("exact symbol name");
+    } else if (sym.name.toLowerCase() === lower) {
+      score = 0.9;
+      reasons.push("case-insensitive exact match");
+    } else {
+      const symTokens = new Set(tokenize(sym.name));
+      const queryIsToken = queryTokens.size === 1 && symTokens.has(lower);
+      const symIsToken = symTokens.size === 1 && queryTokens.has(sym.name.toLowerCase());
+      if (queryIsToken) {
+        score = 0.6;
+        reasons.push("query matches a token of the symbol name");
+      } else if (symIsToken) {
+        score = 0.5;
+        reasons.push("symbol is a token of the query");
+      } else if (sym.name.toLowerCase().includes(lower) && lower.length >= 3) {
+        score = 0.4;
+        reasons.push("symbol name contains query as substring");
+      } else {
+        // Token-set overlap fallback for multi-word queries.
+        let overlap = 0;
+        for (const token of queryTokens) {
+          if (symTokens.has(token)) overlap += 1;
+        }
+        if (overlap > 0) {
+          const jaccard =
+            overlap /
+            Math.max(1, queryTokens.size + symTokens.size - overlap);
+          score = Math.min(0.45, jaccard * 0.9);
+          if (score >= minScore * 0.9) {
+            reasons.push(
+              `token overlap with symbol name (${overlap} shared)`
+            );
+          } else {
+            score = 0;
+          }
+        }
+      }
+    }
+
+    if (score <= 0) continue;
+
+    if (preferExported && sym.exported) {
+      score = Math.min(1, score + 0.08);
+      reasons.push("exported (+0.08)");
+    }
+
+    const penalty = kindPenalty(sym.fileKind, biasAwayFromTests, hintIsTesty);
+    if (penalty !== 0) {
+      score += penalty;
+      reasons.push(
+        `${sym.fileKind.toLowerCase()} file (${penalty > 0 ? "+" : ""}${penalty.toFixed(2)})`
+      );
+    }
+
+    if (score < minScore) continue;
+
+    scored.push({
+      name: sym.name,
+      kind: sym.kind,
+      line: sym.line,
+      endLine: sym.endLine,
+      exported: sym.exported,
+      filePath: sym.filePath,
+      fileKind: sym.fileKind,
+      fileLanguage: sym.fileLanguage,
+      score: Math.max(0, Math.min(1, score)),
+      reasons,
+    });
+  }
+
+  scored.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    if (a.filePath.length !== b.filePath.length)
+      return a.filePath.length - b.filePath.length;
+    return a.filePath < b.filePath ? -1 : a.filePath > b.filePath ? 1 : 0;
   });
 
   return scored.slice(0, limit);

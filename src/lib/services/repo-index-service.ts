@@ -26,7 +26,11 @@ import {
   resolvePath,
   type ResolvedCandidate,
   type ResolvePathOptions,
+  resolveSymbol,
+  type ResolvedSymbolCandidate,
+  type ResolveSymbolOptions,
 } from "@/lib/repo-index/resolver";
+import { syncSymbolsForSnapshot } from "@/lib/repo-index/symbol-sync";
 import { getDecryptedAccessToken } from "@/lib/services/github-account-service";
 
 /// Hard cap on files we persist per snapshot. A repo with more than this is
@@ -178,6 +182,10 @@ export type SyncRepoTreeInput = {
   /// Default true. Callers that want to force a fresh tree read (e.g. the
   /// "Re-sync" button) can pass false.
   reuseExisting?: boolean;
+  /// If true, run symbol extraction inline after the tree sync completes.
+  /// Default true. Can be disabled for faster "just show me files" syncs;
+  /// the caller can then invoke `syncSymbols` later.
+  includeSymbols?: boolean;
 };
 
 /// Builds a tree-only TargRepoSnapshot for the given TargRepoLink. Idempotent:
@@ -187,6 +195,7 @@ export async function syncRepoTree(
   input: SyncRepoTreeInput
 ): Promise<RepoSnapshotSummary> {
   const reuseExisting = input.reuseExisting ?? true;
+  const includeSymbols = input.includeSymbols ?? true;
   const repoLink = await assertUserCanAccessRepoLink(input);
 
   const token = await getDecryptedAccessToken(input.userId);
@@ -299,15 +308,47 @@ export async function syncRepoTree(
         `Only the first ${MAX_FILES_PER_SNAPSHOT} files were indexed (repo has ${blobs.length}).`
       );
     }
-    const isPartial = partialReasons.length > 0;
 
+    await prisma.targRepoSnapshot.update({
+      where: { id: snapshot.id },
+      data: {
+        status: "SYNCING",
+        statusDetail: null,
+        treeSyncedAt: new Date(),
+        fileCount: capped.length,
+      },
+    });
+
+    await prisma.targRepoLink.update({
+      where: { id: repoLink.id },
+      data: { latestSnapshotId: snapshot.id, lastSyncedAt: new Date() },
+    });
+
+    if (includeSymbols) {
+      try {
+        const symbolResult = await syncSymbolsForSnapshot({
+          prisma,
+          snapshotId: snapshot.id,
+          owner: repoLink.ownerLogin,
+          name: repoLink.repoName,
+          token,
+        });
+        partialReasons.push(...symbolResult.partialReasons);
+      } catch (error) {
+        partialReasons.push(
+          `Symbol indexing failed: ${
+            error instanceof Error ? error.message : "unknown error"
+          }.`
+        );
+      }
+    }
+
+    const isPartial = partialReasons.length > 0;
     const updated = await prisma.targRepoSnapshot.update({
       where: { id: snapshot.id },
       data: {
         status: isPartial ? "PARTIAL" : "READY",
         statusDetail: isPartial ? partialReasons.join(" ") : null,
-        treeSyncedAt: new Date(),
-        fileCount: capped.length,
       },
       select: {
         id: true,
@@ -323,11 +364,6 @@ export async function syncRepoTree(
         createdAt: true,
         updatedAt: true,
       },
-    });
-
-    await prisma.targRepoLink.update({
-      where: { id: repoLink.id },
-      data: { latestSnapshotId: updated.id, lastSyncedAt: new Date() },
     });
 
     return toSummary(updated, false);
@@ -418,6 +454,50 @@ export async function listLatestSnapshotsByWorkspace(
     }
   }
   return result;
+}
+
+export type ResolveSymbolInSnapshotInput = {
+  snapshotId: string | null;
+  query: string;
+  options?: ResolveSymbolOptions;
+};
+
+export async function resolveSymbolInSnapshot(
+  input: ResolveSymbolInSnapshotInput
+): Promise<ResolvedSymbolCandidate[]> {
+  if (!input.snapshotId) return [];
+  if (!input.query || !input.query.trim()) return [];
+
+  const rows = await prisma.targRepoSymbol.findMany({
+    where: { snapshotId: input.snapshotId },
+    select: {
+      name: true,
+      kind: true,
+      line: true,
+      endLine: true,
+      exported: true,
+      file: {
+        select: {
+          path: true,
+          kind: true,
+          language: true,
+        },
+      },
+    },
+  });
+
+  const symbols = rows.map((row) => ({
+    name: row.name,
+    kind: row.kind,
+    line: row.line,
+    endLine: row.endLine,
+    exported: row.exported,
+    filePath: row.file.path,
+    fileKind: row.file.kind,
+    fileLanguage: row.file.language,
+  }));
+
+  return resolveSymbol(input.query, symbols, input.options);
 }
 
 export type ResolvePathInSnapshotInput = {
