@@ -1,0 +1,220 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import {
+  exchangeCodeForToken,
+  getAuthenticatedUser,
+  getRepo,
+  GithubApiError,
+  listUserRepos,
+} from "./client";
+
+const fetchMock = vi.fn();
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+beforeEach(() => {
+  fetchMock.mockReset();
+  vi.stubGlobal("fetch", fetchMock);
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+describe("github client", () => {
+  describe("getAuthenticatedUser", () => {
+    it("projects the user payload and includes auth headers", async () => {
+      fetchMock.mockResolvedValueOnce(
+        jsonResponse({
+          id: 42,
+          login: "octo",
+          name: "Octo Cat",
+          avatar_url: "https://example.com/a.png",
+        })
+      );
+
+      const user = await getAuthenticatedUser("ghu_token");
+
+      expect(user).toEqual({
+        id: 42,
+        login: "octo",
+        name: "Octo Cat",
+        avatar_url: "https://example.com/a.png",
+      });
+      expect(fetchMock).toHaveBeenCalledOnce();
+      const [, init] = fetchMock.mock.calls[0];
+      const headers = new Headers(init.headers);
+      expect(headers.get("Authorization")).toBe("Bearer ghu_token");
+      expect(headers.get("Accept")).toContain("github");
+      expect(headers.get("X-GitHub-Api-Version")).toBeTruthy();
+    });
+
+    it("throws GithubApiError on non-2xx", async () => {
+      fetchMock.mockResolvedValueOnce(
+        jsonResponse({ message: "Bad credentials" }, 401)
+      );
+
+      await expect(getAuthenticatedUser("bad")).rejects.toBeInstanceOf(
+        GithubApiError
+      );
+    });
+  });
+
+  describe("listUserRepos", () => {
+    it("normalises visibility and permissions", async () => {
+      fetchMock.mockResolvedValueOnce(
+        jsonResponse([
+          {
+            id: 1,
+            name: "repo-a",
+            full_name: "octo/repo-a",
+            owner: { login: "octo" },
+            default_branch: "main",
+            private: false,
+            visibility: "public",
+            description: "a",
+            html_url: "https://github.com/octo/repo-a",
+            clone_url: "https://github.com/octo/repo-a.git",
+            pushed_at: "2024-01-01T00:00:00Z",
+            updated_at: "2024-01-02T00:00:00Z",
+            archived: false,
+            permissions: { admin: true, push: true, pull: true },
+          },
+          {
+            id: 2,
+            name: "repo-b",
+            full_name: "octo/repo-b",
+            owner: { login: "octo" },
+            default_branch: "develop",
+            private: true,
+            description: null,
+            html_url: "https://github.com/octo/repo-b",
+            clone_url: "https://github.com/octo/repo-b.git",
+            pushed_at: null,
+            updated_at: null,
+            archived: true,
+            permissions: { admin: false, push: false, pull: true },
+          },
+        ])
+      );
+
+      const repos = await listUserRepos("tok");
+
+      expect(repos).toHaveLength(2);
+      expect(repos[0].visibility).toBe("public");
+      expect(repos[1].visibility).toBe("private");
+      expect(repos[1].archived).toBe(true);
+      expect(repos[0].permissions.admin).toBe(true);
+      expect(repos[1].permissions.admin).toBe(false);
+    });
+
+    it("passes pagination + affiliation params", async () => {
+      fetchMock.mockResolvedValueOnce(jsonResponse([]));
+
+      await listUserRepos("tok", {
+        page: 3,
+        perPage: 25,
+        affiliation: ["owner"],
+        sort: "pushed",
+      });
+
+      const [calledUrl] = fetchMock.mock.calls[0];
+      const url = new URL(calledUrl);
+      expect(url.searchParams.get("page")).toBe("3");
+      expect(url.searchParams.get("per_page")).toBe("25");
+      expect(url.searchParams.get("affiliation")).toBe("owner");
+      expect(url.searchParams.get("sort")).toBe("pushed");
+    });
+
+    it("caps perPage at 100", async () => {
+      fetchMock.mockResolvedValueOnce(jsonResponse([]));
+
+      await listUserRepos("tok", { perPage: 1000 });
+      const [calledUrl] = fetchMock.mock.calls[0];
+      expect(new URL(calledUrl).searchParams.get("per_page")).toBe("100");
+    });
+  });
+
+  describe("getRepo", () => {
+    it("encodes owner/name correctly", async () => {
+      fetchMock.mockResolvedValueOnce(
+        jsonResponse({
+          id: 1,
+          name: "repo a",
+          full_name: "octo/repo a",
+          owner: { login: "octo" },
+          default_branch: "main",
+          private: false,
+          description: null,
+          html_url: "x",
+          clone_url: "y",
+          pushed_at: null,
+          updated_at: null,
+          archived: false,
+        })
+      );
+
+      await getRepo("tok", "octo", "repo a");
+
+      const [calledUrl] = fetchMock.mock.calls[0];
+      expect(calledUrl).toContain("/repos/octo/repo%20a");
+    });
+  });
+
+  describe("exchangeCodeForToken", () => {
+    it("returns normalized token fields on success", async () => {
+      fetchMock.mockResolvedValueOnce(
+        jsonResponse({
+          access_token: "ghu_xyz",
+          refresh_token: "ghr_abc",
+          expires_in: 3600,
+          scope: "read:user repo",
+          token_type: "bearer",
+        })
+      );
+
+      const result = await exchangeCodeForToken({
+        code: "code123",
+        clientId: "id",
+        clientSecret: "secret",
+        redirectUri: "https://targ.example/callback",
+      });
+
+      expect(result.accessToken).toBe("ghu_xyz");
+      expect(result.refreshToken).toBe("ghr_abc");
+      expect(result.scope).toBe("read:user repo");
+      expect(result.tokenType).toBe("bearer");
+      expect(result.expiresAt).toBeInstanceOf(Date);
+
+      const [, init] = fetchMock.mock.calls[0];
+      expect(init.method).toBe("POST");
+      expect(String(init.body)).toContain("code=code123");
+    });
+
+    it("throws on GitHub error payloads", async () => {
+      fetchMock.mockResolvedValueOnce(
+        jsonResponse(
+          {
+            error: "bad_verification_code",
+            error_description: "The code is incorrect.",
+          },
+          200
+        )
+      );
+
+      await expect(
+        exchangeCodeForToken({
+          code: "bad",
+          clientId: "id",
+          clientSecret: "secret",
+          redirectUri: "https://targ.example/callback",
+        })
+      ).rejects.toBeInstanceOf(GithubApiError);
+    });
+  });
+});

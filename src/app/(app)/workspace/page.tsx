@@ -5,11 +5,21 @@ import {
   AdminPage,
   AdminSection,
 } from "@/components/ui/admin-surface";
+import { WorkspaceRepoConnections } from "@/components/workspace-repo-connections";
 import { getWorkspaceForUser } from "@/lib/services/workspace-service";
 import { formatRelativeDate } from "@/lib/utils/format";
 import { workspacePlaybookSummary } from "@/lib/workspace/playbook";
 
-export default async function WorkspacePage() {
+type WorkspacePageSearchParams = Promise<{
+  github_connected?: string;
+  github_error?: string;
+}>;
+
+export default async function WorkspacePage({
+  searchParams,
+}: {
+  searchParams?: WorkspacePageSearchParams;
+}) {
   const currentUser = await requireCurrentUser();
   const workspace = currentUser.currentWorkspace;
   const workspaceDetails =
@@ -19,6 +29,10 @@ export default async function WorkspacePage() {
   const playbookSummary = workspaceDetails?.playbook
     ? workspacePlaybookSummary(workspaceDetails.playbook)
     : null;
+
+  const resolvedParams = searchParams ? await searchParams : undefined;
+  const githubConnectedHint = resolvedParams?.github_connected === "1";
+  const githubErrorHint = resolvedParams?.github_error ?? null;
 
   return (
     <AdminPage
@@ -83,7 +97,26 @@ export default async function WorkspacePage() {
       </AdminSection>
 
       <AdminSection
-        title="Integrations"
+        title="Code repositories"
+        description="Link a GitHub repository so Handoff Packets can reference real paths, branches, and commit SHAs."
+      >
+        {workspace ? (
+          <WorkspaceRepoConnections
+            workspaceId={workspace.id}
+            initialConnectedHint={githubConnectedHint}
+            initialErrorHint={githubErrorHint}
+          />
+        ) : (
+          <AdminItem
+            label="Status"
+            value="No workspace"
+            hint="Create a workspace before connecting a repository."
+          />
+        )}
+      </AdminSection>
+
+      <AdminSection
+        title="Other integrations"
         description="Targ is standalone-first. Links to other systems will stay optional."
       >
         <AdminGroupLabel>Bring data in</AdminGroupLabel>
@@ -96,12 +129,6 @@ export default async function WorkspacePage() {
           label="Issue or ticket system"
           value="Not connected"
           hint="Future: push a saved action draft out as context—still your workflow, not Targ as PM."
-        />
-        <AdminGroupLabel>Send outcomes out</AdminGroupLabel>
-        <AdminItem
-          label="Execution handoff"
-          value="Not configured"
-          hint="When added, this will be an export or link step after you review a draft—not auto-assignment."
         />
       </AdminSection>
 

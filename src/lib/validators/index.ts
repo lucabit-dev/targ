@@ -216,6 +216,52 @@ export const createHandoffInputSchema = z
   })
   .strict();
 
+// GitHub owner and repo names: GitHub allows alphanumerics, hyphens, underscores
+// and dots; owner may also include dots; we keep the regex permissive but
+// reject obvious separators to avoid injection into API URLs.
+const githubNameSegmentRegex = /^[A-Za-z0-9._-]+$/;
+
+export const connectRepoInputSchema = z
+  .object({
+    owner: z
+      .string()
+      .trim()
+      .min(1, "Repository owner is required.")
+      .max(120)
+      .regex(githubNameSegmentRegex, "Invalid repository owner."),
+    name: z
+      .string()
+      .trim()
+      .min(1, "Repository name is required.")
+      .max(120)
+      .regex(githubNameSegmentRegex, "Invalid repository name."),
+  })
+  .strict();
+
+/// Accepts either the structured `{ owner, name }` form or a single `fullName`
+/// string (e.g. "vercel/next.js"), which the parser splits on `/`.
+export const connectRepoRequestSchema = z
+  .union([
+    connectRepoInputSchema,
+    z
+      .object({
+        fullName: z
+          .string()
+          .trim()
+          .min(3)
+          .max(240)
+          .regex(
+            /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/,
+            "Use the format owner/name."
+          ),
+      })
+      .strict()
+      .transform(({ fullName }) => {
+        const [owner, name] = fullName.split("/", 2);
+        return { owner, name };
+      }),
+  ]);
+
 export type SignupInput = z.infer<typeof signupInputSchema>;
 export type LoginInput = z.infer<typeof loginInputSchema>;
 export type CreateWorkspaceInput = z.infer<typeof createWorkspaceInputSchema>;
@@ -241,3 +287,5 @@ export type ActionDraftStatus = z.infer<typeof actionDraftStatusSchema>;
 export type UpdateDraftInput = z.infer<typeof updateDraftInputSchema>;
 export type HandoffTargetInput = z.infer<typeof handoffTargetInputSchema>;
 export type CreateHandoffInput = z.infer<typeof createHandoffInputSchema>;
+export type ConnectRepoInputValidated = z.infer<typeof connectRepoInputSchema>;
+export type ConnectRepoRequestValidated = z.infer<typeof connectRepoRequestSchema>;

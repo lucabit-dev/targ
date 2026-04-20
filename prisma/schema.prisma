@@ -134,28 +134,46 @@ enum WorkBundleStatus {
   DISMISSED
 }
 
+/// Which third-party repo host a TargRepoLink points at. Only GitHub is wired
+/// today; GitLab/Bitbucket can be added without changing surface shape.
+enum RepoProvider {
+  GITHUB
+}
+
+/// Visibility of a connected repo at sync time. `UNKNOWN` is the default until
+/// the first metadata fetch succeeds; used by the UI to warn about permissions.
+enum RepoVisibility {
+  PUBLIC
+  PRIVATE
+  INTERNAL
+  UNKNOWN
+}
+
 model User {
-  id           String                @id @default(cuid())
-  email        String                @unique
-  passwordHash String
-  name         String?
-  createdAt    DateTime              @default(now())
-  updatedAt    DateTime              @updatedAt
-  memberships  WorkspaceMembership[]
-  createdCases TargCase[]            @relation("CasesCreatedByUser")
-  analysisRuns TargAnalysisRun[]     @relation("AnalysisRunsCreatedByUser")
+  id                 String                @id @default(cuid())
+  email              String                @unique
+  passwordHash       String
+  name               String?
+  createdAt          DateTime              @default(now())
+  updatedAt          DateTime              @updatedAt
+  memberships        WorkspaceMembership[]
+  createdCases       TargCase[]            @relation("CasesCreatedByUser")
+  analysisRuns       TargAnalysisRun[]     @relation("AnalysisRunsCreatedByUser")
+  githubAccount      TargGithubAccount?
+  connectedRepoLinks TargRepoLink[]        @relation("RepoLinksConnectedByUser")
 }
 
 model Workspace {
-  id                String                @id @default(cuid())
-  name              String
-  personalForUserId String?               @unique
-  playbookConfig    Json?
+  id                   String                @id @default(cuid())
+  name                 String
+  personalForUserId    String?               @unique
+  playbookConfig       Json?
   playbookConfiguredAt DateTime?
-  createdAt         DateTime              @default(now())
-  updatedAt         DateTime              @updatedAt
-  memberships       WorkspaceMembership[]
-  cases             TargCase[]
+  createdAt            DateTime              @default(now())
+  updatedAt            DateTime              @updatedAt
+  memberships          WorkspaceMembership[]
+  cases                TargCase[]
+  repoLinks            TargRepoLink[]
 }
 
 model WorkspaceMembership {
@@ -173,15 +191,15 @@ model WorkspaceMembership {
 }
 
 model TargCase {
-  id                   String            @id @default(cuid())
+  id                   String                  @id @default(cuid())
   workspaceId          String
   title                String
   createdByUserId      String
   workflowState        CaseWorkflowState
   analysisState        CaseAnalysisState
   draftState           CaseDraftState
-  breakdownState       CaseBreakdownState   @default(NOT_STARTED)
-  workBundleState      CaseWorkBundleState  @default(NOT_STARTED)
+  breakdownState       CaseBreakdownState      @default(NOT_STARTED)
+  workBundleState      CaseWorkBundleState     @default(NOT_STARTED)
   userProblemStatement String
   /// Optional: shapes bundle depth and fix vs investigate bias.
   solveMode            CaseSolveMode?
@@ -193,12 +211,16 @@ model TargCase {
   latestDraftId        String?
   latestBreakdownId    String?
   latestWorkBundleId   String?
-  evidenceVersion      Int               @default(1)
-  createdAt            DateTime          @default(now())
-  updatedAt            DateTime          @updatedAt
+  evidenceVersion      Int                     @default(1)
+  /// Optional FK: the repo this case is scoped to. Null until the workspace
+  /// has a repo linked or the user picks one for this case.
+  repoLinkId           String?
+  createdAt            DateTime                @default(now())
+  updatedAt            DateTime                @updatedAt
   resolvedAt           DateTime?
-  workspace            Workspace         @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
-  createdByUser        User              @relation("CasesCreatedByUser", fields: [createdByUserId], references: [id], onDelete: Cascade)
+  workspace            Workspace               @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  createdByUser        User                    @relation("CasesCreatedByUser", fields: [createdByUserId], references: [id], onDelete: Cascade)
+  repoLink             TargRepoLink?           @relation(fields: [repoLinkId], references: [id], onDelete: SetNull)
   evidence             TargEvidence[]
   analysisRuns         TargAnalysisRun[]
   diagnosisSnapshots   TargDiagnosisSnapshot[]
@@ -211,6 +233,7 @@ model TargCase {
   @@index([latestBreakdownId])
   @@index([latestWorkBundleId])
   @@index([createdByUserId])
+  @@index([repoLinkId])
 }
 
 model TargEvidence {
@@ -235,11 +258,11 @@ model TargEvidence {
 }
 
 model TargAnalysisRun {
-  id                 String            @id @default(cuid())
+  id                 String                  @id @default(cuid())
   caseId             String
   createdByUserId    String
-  status             AnalysisRunStatus @default(ANALYZING)
-  questionCount      Int               @default(0)
+  status             AnalysisRunStatus       @default(ANALYZING)
+  questionCount      Int                     @default(0)
   pendingQuestion    String?
   pendingOptions     Json?
   answers            Json?
@@ -247,10 +270,10 @@ model TargAnalysisRun {
   failureMessage     String?
   latestDiagnosisId  String?
   completedAt        DateTime?
-  createdAt          DateTime          @default(now())
-  updatedAt          DateTime          @updatedAt
-  case               TargCase          @relation(fields: [caseId], references: [id], onDelete: Cascade)
-  createdByUser      User              @relation("AnalysisRunsCreatedByUser", fields: [createdByUserId], references: [id], onDelete: Cascade)
+  createdAt          DateTime                @default(now())
+  updatedAt          DateTime                @updatedAt
+  case               TargCase                @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  createdByUser      User                    @relation("AnalysisRunsCreatedByUser", fields: [createdByUserId], references: [id], onDelete: Cascade)
   diagnosisSnapshots TargDiagnosisSnapshot[]
 
   @@index([caseId, createdAt(sort: Desc)])
@@ -259,31 +282,31 @@ model TargAnalysisRun {
 }
 
 model TargDiagnosisSnapshot {
-  id                 String                   @id @default(cuid())
-  caseId             String
-  analysisRunId      String
+  id                  String                  @id @default(cuid())
+  caseId              String
+  analysisRunId       String
   caseEvidenceVersion Int
-  status             String
-  confidence         CaseConfidence
+  status              String
+  confidence          CaseConfidence
   /// User-facing problem framing (scope, restatement). Append-only with snapshot.
-  problemBrief       Json?
-  probableRootCause  String
-  affectedArea       String
-  summary            String
-  trace              Json
-  hypotheses         Json
-  contradictions     Json
-  missingEvidence    Json
-  nextActionMode     DiagnosisNextActionMode
-  nextActionText     String
-  claimReferences    Json
-  createdAt          DateTime                 @default(now())
-  case               TargCase                 @relation(fields: [caseId], references: [id], onDelete: Cascade)
-  analysisRun        TargAnalysisRun          @relation(fields: [analysisRunId], references: [id], onDelete: Cascade)
-  claimReferenceRows TargClaimReference[]
-  actionDrafts       TargActionDraft[]
-  breakdowns         TargBreakdown[]
-  workBundles        TargWorkBundle[]
+  problemBrief        Json?
+  probableRootCause   String
+  affectedArea        String
+  summary             String
+  trace               Json
+  hypotheses          Json
+  contradictions      Json
+  missingEvidence     Json
+  nextActionMode      DiagnosisNextActionMode
+  nextActionText      String
+  claimReferences     Json
+  createdAt           DateTime                @default(now())
+  case                TargCase                @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  analysisRun         TargAnalysisRun         @relation(fields: [analysisRunId], references: [id], onDelete: Cascade)
+  claimReferenceRows  TargClaimReference[]
+  actionDrafts        TargActionDraft[]
+  breakdowns          TargBreakdown[]
+  workBundles         TargWorkBundle[]
 
   @@index([caseId, createdAt(sort: Desc)])
   @@index([analysisRunId])
@@ -310,31 +333,31 @@ model TargClaimReference {
 /// Structured decomposition for a single diagnosis revision (append-only).
 /// JSON fields follow `src/lib/planning/bundle-types.ts` (Targ-native schema).
 model TargBreakdown {
-  id                   String                @id @default(cuid())
-  caseId               String
-  diagnosisSnapshotId  String
-  caseEvidenceVersion  Int
-  schemaVersion        Int                   @default(1)
+  id                    String                @id @default(cuid())
+  caseId                String
+  diagnosisSnapshotId   String
+  caseEvidenceVersion   Int
+  schemaVersion         Int                   @default(1)
   /// Problem taxonomy + facets (optional until classifier runs).
   problemClassification Json?
   /// Shared spine: observed signal, boundaries, evidence index, decision stub, etc.
-  sharedSpine          Json
+  sharedSpine           Json
   /// Mode-specific extension blocks (functional, experience, …).
-  modeExtensions       Json
+  modeExtensions        Json
   /// Ranked hypotheses with keys stable for bundle task linking.
-  rankedHypotheses     Json
+  rankedHypotheses      Json
   /// Open questions / falsification criteria not yet closed.
-  unknowns             Json
+  unknowns              Json
   /// Cross-artifact deps (e.g. hypothesis H2 depends on evidence E1).
-  artifactDependencies Json
+  artifactDependencies  Json
   /// Anchors to TargEvidence ids + semantic roles for bundle tasks.
-  evidenceAnchors      Json
+  evidenceAnchors       Json
   /// Snapshot of diagnosis confidence at generation time (lineage).
-  inheritedConfidence  CaseConfidence?
-  createdAt            DateTime              @default(now())
-  case                 TargCase              @relation(fields: [caseId], references: [id], onDelete: Cascade)
-  diagnosisSnapshot    TargDiagnosisSnapshot @relation(fields: [diagnosisSnapshotId], references: [id], onDelete: Cascade)
-  workBundles          TargWorkBundle[]
+  inheritedConfidence   CaseConfidence?
+  createdAt             DateTime              @default(now())
+  case                  TargCase              @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  diagnosisSnapshot     TargDiagnosisSnapshot @relation(fields: [diagnosisSnapshotId], references: [id], onDelete: Cascade)
+  workBundles           TargWorkBundle[]
 
   @@index([caseId, createdAt(sort: Desc)])
   @@index([diagnosisSnapshotId])
@@ -362,7 +385,7 @@ model TargWorkBundle {
 }
 
 model TargActionDraft {
-  id                  String            @id @default(cuid())
+  id                  String                @id @default(cuid())
   caseId              String
   diagnosisSnapshotId String
   type                ActionDraftType
@@ -373,11 +396,11 @@ model TargActionDraft {
   suggestedSteps      Json
   risksOrUnknowns     Json?
   linkedEvidenceIds   Json
-  status              ActionDraftStatus @default(DRAFTED)
-  createdAt           DateTime          @default(now())
-  updatedAt           DateTime          @updatedAt
+  status              ActionDraftStatus     @default(DRAFTED)
+  createdAt           DateTime              @default(now())
+  updatedAt           DateTime              @updatedAt
   savedAt             DateTime?
-  case                TargCase          @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  case                TargCase              @relation(fields: [caseId], references: [id], onDelete: Cascade)
   diagnosisSnapshot   TargDiagnosisSnapshot @relation(fields: [diagnosisSnapshotId], references: [id], onDelete: Cascade)
 
   @@index([caseId, createdAt(sort: Desc)])
@@ -400,24 +423,74 @@ enum HandoffTarget {
 }
 
 model TargHandoff {
-  id            String        @id @default(cuid())
-  caseId        String
-  diagnosisId   String?
-  workBundleId  String?
-  target        HandoffTarget
+  id              String        @id @default(cuid())
+  caseId          String
+  diagnosisId     String?
+  workBundleId    String?
+  target          HandoffTarget
   /// Rendered Markdown actually delivered to the target (post-truncation).
-  packetMd      String
+  packetMd        String
   /// Structured HandoffPacket object that produced `packetMd`; keep for replay.
-  packetJson    Json
+  packetJson      Json
   /// URL / issue number / PR url returned by the target, when applicable.
-  externalRef   String?
+  externalRef     String?
   /// Truncation steps that ran before rendering, for debugging packet size.
   truncationSteps Json?
   createdByUserId String
-  createdAt     DateTime      @default(now())
-  case          TargCase      @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  createdAt       DateTime      @default(now())
+  case            TargCase      @relation(fields: [caseId], references: [id], onDelete: Cascade)
 
   @@index([caseId, createdAt(sort: Desc)])
   @@index([target])
   @@index([createdByUserId])
+}
+
+/// Per-user OAuth tokens for an external repo host. One row per (user, provider)
+/// today (effectively just GitHub). Tokens are stored encrypted at rest.
+model TargGithubAccount {
+  id              String    @id @default(cuid())
+  userId          String    @unique
+  /// GitHub's numeric user id (stable across logins; login can change).
+  githubUserId    Int       @unique
+  githubLogin     String
+  avatarUrl       String?
+  /// Encrypted access token (AES-256-GCM, key from APP_TOKEN_ENCRYPTION_KEY).
+  accessTokenEnc  String
+  /// Encrypted refresh token, if the OAuth app uses refresh tokens.
+  refreshTokenEnc String?
+  expiresAt       DateTime?
+  scope           String
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([githubLogin])
+}
+
+/// A workspace <-> external repo association. Source of truth for repo context
+/// used by the Handoff Packet (paths, branches, commit SHAs).
+model TargRepoLink {
+  id                String         @id @default(cuid())
+  workspaceId       String
+  /// Which user's OAuth token authorised this link. If that user loses access
+  /// we may need to prompt another member to re-auth.
+  connectedByUserId String
+  provider          RepoProvider   @default(GITHUB)
+  /// Provider's numeric repo id. Stable across renames.
+  githubRepoId      Int
+  ownerLogin        String
+  repoName          String
+  defaultBranch     String
+  remoteUrl         String
+  visibility        RepoVisibility @default(UNKNOWN)
+  lastSyncedAt      DateTime?
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+  workspace         Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  connectedByUser   User           @relation("RepoLinksConnectedByUser", fields: [connectedByUserId], references: [id], onDelete: Cascade)
+  cases             TargCase[]
+
+  @@unique([workspaceId, githubRepoId])
+  @@index([workspaceId])
+  @@index([connectedByUserId])
 }
