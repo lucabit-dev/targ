@@ -7,6 +7,10 @@ import { formatRelativeDate } from "@/lib/utils/format";
 
 import { CaseAnalysisSurface } from "@/components/case-analysis-surface";
 import { CaseEvidenceWorkspace } from "@/components/case-evidence-workspace";
+import {
+  CaseRepoLinkPicker,
+  type CaseRepoLinkSummary,
+} from "@/components/case-repo-link-picker";
 import { DraftReviewSheet } from "@/components/draft-review-sheet";
 import { InspectPanel } from "@/components/inspect-panel";
 import { Button, Chip, Surface } from "@/components/ui/primitives";
@@ -27,6 +31,7 @@ import type { EvidenceViewModel } from "@/lib/evidence/view-model";
 
 type CaseViewShellProps = {
   caseId: string;
+  caseWorkspaceId: string;
   caseTitle: string;
   caseProblemStatement: string;
   caseProblemLens?: CaseProblemLens | null;
@@ -44,6 +49,7 @@ type CaseViewShellProps = {
   initialSolveMode?: CaseSolveMode | null;
   initialBreakdown: BreakdownViewModel | null;
   initialWorkBundle: WorkBundleViewModel | null;
+  initialRepoLink: CaseRepoLinkSummary | null;
 };
 
 type DraftResponse = {
@@ -53,6 +59,7 @@ type DraftResponse = {
 
 export function CaseViewShell({
   caseId,
+  caseWorkspaceId,
   caseTitle,
   caseProblemStatement,
   caseProblemLens = null,
@@ -70,6 +77,7 @@ export function CaseViewShell({
   initialSolveMode = null,
   initialBreakdown,
   initialWorkBundle,
+  initialRepoLink,
 }: CaseViewShellProps) {
   const router = useRouter();
   const [evidence, setEvidence] = useState(initialEvidence);
@@ -612,6 +620,17 @@ export function CaseViewShell({
                   >
                     Updated {formatRelativeDate(caseUpdatedAt)}
                   </time>
+                  <span
+                    className="select-none text-[11px] text-[var(--color-text-muted)] opacity-50"
+                    aria-hidden
+                  >
+                    ·
+                  </span>
+                  <CaseRepoLinkPicker
+                    caseId={caseId}
+                    workspaceId={caseWorkspaceId}
+                    initialRepoLink={initialRepoLink}
+                  />
                 </div>
                 <div className="mt-2.5 flex flex-wrap items-center gap-x-2 gap-y-1.5 text-[12px] leading-[18px]">
                   <span className="font-semibold uppercase tracking-[0.08em] text-[var(--color-accent-primary)]">

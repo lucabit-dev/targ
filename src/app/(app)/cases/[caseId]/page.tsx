@@ -57,6 +57,7 @@ export default async function CasePage({ params }: CasePageProps) {
 
       <CaseViewShell
         caseId={caseId}
+        caseWorkspaceId={currentCase.workspaceId}
         caseTitle={currentCase.title}
         caseProblemStatement={currentCase.userProblemStatement}
         caseProblemLens={currentCase.problemLens}
@@ -74,6 +75,7 @@ export default async function CasePage({ params }: CasePageProps) {
         initialSolveMode={currentCase.solveMode}
         initialBreakdown={planningArtifacts?.breakdown ?? null}
         initialWorkBundle={planningArtifacts?.workBundle ?? null}
+        initialRepoLink={currentCase.repoLink ?? null}
       />
     </div>
   );
