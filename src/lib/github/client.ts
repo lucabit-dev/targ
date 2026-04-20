@@ -195,6 +195,83 @@ export async function getRepo(
   return normalizeRepo((await response.json()) as GithubRepoApi);
 }
 
+/// Resolves a branch (or any ref) to a full commit SHA. Used as the first step
+/// of a sync: pin the tree read to a specific commit so the resulting snapshot
+/// is reproducible even if the branch advances mid-sync.
+export async function getCommitSha(
+  token: string,
+  owner: string,
+  name: string,
+  ref: string
+): Promise<string> {
+  const response = await githubFetch(
+    `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/commits/${encodeURIComponent(ref)}`,
+    { token }
+  );
+  const payload = (await response.json()) as { sha: string };
+  return payload.sha;
+}
+
+export type GithubTreeEntry = {
+  path: string;
+  mode: string;
+  /// "blob" = file, "tree" = directory, "commit" = submodule. We only persist blobs.
+  type: "blob" | "tree" | "commit";
+  sha: string;
+  size?: number;
+};
+
+export type GithubTreeResult = {
+  sha: string;
+  truncated: boolean;
+  entries: GithubTreeEntry[];
+};
+
+/// Recursive tree read for a commit. GitHub returns up to ~100k entries in a
+/// single call; anything beyond that sets `truncated: true` and the caller
+/// must treat the snapshot as PARTIAL.
+export async function getTreeRecursive(
+  token: string,
+  owner: string,
+  name: string,
+  commitSha: string
+): Promise<GithubTreeResult> {
+  const response = await githubFetch(
+    `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/git/trees/${encodeURIComponent(commitSha)}?recursive=1`,
+    { token }
+  );
+  const payload = (await response.json()) as {
+    sha: string;
+    truncated: boolean;
+    tree: Array<{
+      path: string;
+      mode: string;
+      type: string;
+      sha: string;
+      size?: number;
+    }>;
+  };
+
+  const entries: GithubTreeEntry[] = payload.tree
+    .filter(
+      (entry): entry is GithubTreeEntry =>
+        entry.type === "blob" || entry.type === "tree" || entry.type === "commit"
+    )
+    .map((entry) => ({
+      path: entry.path,
+      mode: entry.mode,
+      type: entry.type,
+      sha: entry.sha,
+      size: entry.size,
+    }));
+
+  return {
+    sha: payload.sha,
+    truncated: Boolean(payload.truncated),
+    entries,
+  };
+}
+
 export type GithubOAuthTokenResponse = {
   accessToken: string;
   refreshToken: string | null;
