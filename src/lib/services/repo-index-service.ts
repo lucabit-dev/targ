@@ -22,6 +22,11 @@ import {
 } from "@/lib/github/client";
 import { prisma } from "@/lib/prisma";
 import { classifyFilePath } from "@/lib/repo-index/classify";
+import {
+  resolvePath,
+  type ResolvedCandidate,
+  type ResolvePathOptions,
+} from "@/lib/repo-index/resolver";
 import { getDecryptedAccessToken } from "@/lib/services/github-account-service";
 
 /// Hard cap on files we persist per snapshot. A repo with more than this is
@@ -413,6 +418,30 @@ export async function listLatestSnapshotsByWorkspace(
     }
   }
   return result;
+}
+
+export type ResolvePathInSnapshotInput = {
+  /// Snapshot to search within. Callers should pass
+  /// `repoLink.latestSnapshotId`; if that is null, return an empty result.
+  snapshotId: string | null;
+  hint: string;
+  options?: ResolvePathOptions;
+};
+
+/// Resolves a hint against a specific snapshot's file list. Thin wrapper that
+/// loads the file metadata once and delegates scoring to `resolvePath`. The
+/// Handoff Packet builder (Phase 2.3) will call this for every evidence item.
+export async function resolvePathInSnapshot(
+  input: ResolvePathInSnapshotInput
+): Promise<ResolvedCandidate[]> {
+  if (!input.snapshotId) return [];
+  if (!input.hint || !input.hint.trim()) return [];
+
+  const files = await prisma.targRepoFile.findMany({
+    where: { snapshotId: input.snapshotId },
+    select: { path: true, kind: true, language: true },
+  });
+  return resolvePath(input.hint, files, input.options);
 }
 
 export async function getLatestSnapshotSummary(
