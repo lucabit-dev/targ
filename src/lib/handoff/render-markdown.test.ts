@@ -589,3 +589,255 @@ describe("phase 2.5 — invariants", () => {
     ).toThrow(/suspected_regression_files_required/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase 2.7 — likely-culprit chip rendering + invariants
+//
+// The chip is a one-line callout under "Best current read" that flags the
+// most-likely-regression-causing commit when culprit detection picked one.
+// The matching regression in `## Repo context` also gets a "← likely
+// culprit" suffix so receivers can correlate.
+// ---------------------------------------------------------------------------
+
+describe("phase 2.7 — likely-culprit rendering", () => {
+  function buildPacketWithCulprit(
+    overrides: {
+      culpritConfidence?: "high" | "medium";
+      culpritSha?: string;
+      regressionPrNumber?: number;
+    } = {}
+  ) {
+    const culpritSha = overrides.culpritSha ?? "abc123def456aaaa";
+    const prNumber = overrides.regressionPrNumber ?? 842;
+    return buildHandoffPacket({
+      ...CONTRADICTION_FIXTURE_INPUT,
+      repoEnrichment: {
+        repoFullName: "acme/checkout",
+        ref: "deadbeef0000000000000000000000000000cafe",
+        suspectedRegressions: [
+          {
+            sha: culpritSha,
+            message: "fix: null check in checkout (#842)",
+            author: "alice",
+            date: new Date(Date.now() - 2 * 86_400_000).toISOString(),
+            ...(prNumber > 0 ? { prNumber } : {}),
+            url: `https://github.com/acme/checkout/commit/${culpritSha}`,
+            touchedFiles: ["src/lib/checkout.ts"],
+          },
+          {
+            sha: "noisecommitsha000",
+            message: "chore: bump dep",
+            author: "carol",
+            date: new Date(Date.now() - 5 * 86_400_000).toISOString(),
+            touchedFiles: ["package.json"],
+          },
+        ],
+        likelyCulprit: {
+          sha: culpritSha,
+          confidence: overrides.culpritConfidence ?? "high",
+          reasons: [
+            'matches affected area: "checkout flow"',
+            "touched 1 of 1 suspected file",
+            "merged 2 days ago",
+          ],
+        },
+      },
+    });
+  }
+
+  it("renders 'Likely culprit:' chip for high-confidence picks", () => {
+    const markdown = renderPacketMarkdown(buildPacketWithCulprit());
+    expect(markdown).toMatch(/\*\*Likely culprit:\*\*/);
+    // Linked PR + author + recency + reasons.
+    expect(markdown).toMatch(
+      /\[#842\]\(https:\/\/github\.com\/acme\/checkout\/pull\/842\)/
+    );
+    expect(markdown).toContain("@alice");
+    expect(markdown).toMatch(/matches affected area/);
+  });
+
+  it("downgrades to 'Possible culprit:' for medium-confidence picks", () => {
+    const markdown = renderPacketMarkdown(
+      buildPacketWithCulprit({ culpritConfidence: "medium" })
+    );
+    expect(markdown).toMatch(/\*\*Possible culprit:\*\*/);
+    expect(markdown).not.toMatch(/\*\*Likely culprit:\*\*/);
+  });
+
+  it("places the chip inside Best current read, before ## Evidence", () => {
+    const markdown = renderPacketMarkdown(buildPacketWithCulprit());
+    const bestReadEnd = markdown.indexOf("## Evidence");
+    const culpritIdx = markdown.search(/\*\*Likely culprit:\*\*/);
+    expect(culpritIdx).toBeGreaterThan(0);
+    expect(culpritIdx).toBeLessThan(bestReadEnd);
+  });
+
+  it("marks the matching regression bullet with a ← culprit suffix", () => {
+    const markdown = renderPacketMarkdown(buildPacketWithCulprit());
+    expect(markdown).toMatch(/← \*\*likely culprit \(high\)\*\*/);
+    // Only the matching one — the noise commit must NOT carry the suffix.
+    const noiseLine = markdown
+      .split("\n")
+      .find((line) => line.includes("noisecommitsha000") || line.includes("@carol"));
+    expect(noiseLine).toBeDefined();
+    expect(noiseLine).not.toMatch(/← \*\*likely culprit/);
+  });
+
+  it("falls back to commit SHA in the chip when the regression has no PR number", () => {
+    const markdown = renderPacketMarkdown(
+      buildPacketWithCulprit({ regressionPrNumber: 0 })
+    );
+    // Chip uses the 7-char short SHA when no PR is available.
+    expect(markdown).toMatch(/\*\*Likely culprit:\*\* \[abc123d\]/);
+  });
+
+  it("omits the chip when no culprit is set on repoContext", () => {
+    // Build a packet WITHOUT enrichment.likelyCulprit but WITH regressions.
+    const markdown = renderPacketMarkdown(
+      buildHandoffPacket({
+        ...CONTRADICTION_FIXTURE_INPUT,
+        repoEnrichment: {
+          repoFullName: "acme/checkout",
+          ref: "deadbeef",
+          suspectedRegressions: [
+            {
+              sha: "x",
+              message: "y",
+              author: "alice",
+              date: new Date().toISOString(),
+              touchedFiles: ["src/a.ts"],
+            },
+          ],
+        },
+      })
+    );
+    expect(markdown).not.toMatch(/\*\*Likely culprit:\*\*/);
+    expect(markdown).not.toMatch(/\*\*Possible culprit:\*\*/);
+    expect(markdown).not.toMatch(/← \*\*likely culprit/);
+  });
+
+  it("silently drops a culprit pointing at a SHA NOT in regressions (defense in depth)", () => {
+    // The builder is supposed to drop dangling culprits before they reach
+    // the renderer, but we double-belt-and-suspenders here so a future
+    // regression in the builder can't leak orphan chips into output.
+    // We construct the packet manually to bypass the builder filter.
+    const packet = buildPacketWithCulprit();
+    // Tamper: rewire likelyCulprit to an SHA that isn't in regressions.
+    if (packet.repoContext) {
+      packet.repoContext.likelyCulprit = {
+        sha: "ghostshafetched",
+        confidence: "high",
+        reasons: ["test"],
+      };
+    }
+    const markdown = renderPacketMarkdown(packet);
+    expect(markdown).not.toMatch(/\*\*Likely culprit:\*\*/);
+  });
+});
+
+describe("phase 2.7 — invariants", () => {
+  function packetWithCulprit(
+    culpritOverrides: Record<string, unknown> = {}
+  ) {
+    return buildHandoffPacket({
+      ...CONTRADICTION_FIXTURE_INPUT,
+      repoEnrichment: {
+        repoFullName: "acme/checkout",
+        ref: "deadbeef",
+        suspectedRegressions: [
+          {
+            sha: "winner",
+            message: "fix",
+            author: "alice",
+            date: new Date().toISOString(),
+            touchedFiles: ["src/a.ts"],
+          },
+        ],
+        likelyCulprit: {
+          sha: "winner",
+          confidence: "high",
+          reasons: ["matches"],
+          ...culpritOverrides,
+        },
+      },
+    });
+  }
+
+  it("accepts a well-formed culprit pointing at a real regression", () => {
+    expect(() =>
+      assertPacketValid(packetWithCulprit(), knownEvidenceIdsFromInput())
+    ).not.toThrow();
+  });
+
+  // The builder filters culprits whose sha doesn't appear in regressions
+  // (defense-in-depth — see invariant 11). To test the underlying
+  // invariants we tamper with the packet AFTER the build step so the
+  // assert-time check is what fires.
+  function tamperedCulprit(
+    culpritOverrides: Partial<{
+      sha: unknown;
+      confidence: unknown;
+      reasons: unknown;
+    }>
+  ) {
+    const packet = packetWithCulprit();
+    if (packet.repoContext?.likelyCulprit) {
+      packet.repoContext.likelyCulprit = {
+        ...packet.repoContext.likelyCulprit,
+        ...(culpritOverrides as object),
+      };
+    }
+    return packet;
+  }
+
+  it("rejects a culprit with an empty sha", () => {
+    expect(() =>
+      assertPacketValid(
+        tamperedCulprit({ sha: "  " }),
+        knownEvidenceIdsFromInput()
+      )
+    ).toThrow(/likely_culprit_sha_required/);
+  });
+
+  it("rejects a culprit with confidence outside {high, medium}", () => {
+    expect(() =>
+      assertPacketValid(
+        tamperedCulprit({ confidence: "low" }),
+        knownEvidenceIdsFromInput()
+      )
+    ).toThrow(/likely_culprit_confidence_band/);
+  });
+
+  it("rejects a culprit with empty reasons", () => {
+    expect(() =>
+      assertPacketValid(
+        tamperedCulprit({ reasons: [] }),
+        knownEvidenceIdsFromInput()
+      )
+    ).toThrow(/likely_culprit_reasons_required/);
+  });
+
+  it("rejects a culprit with a blank reason string", () => {
+    expect(() =>
+      assertPacketValid(
+        tamperedCulprit({ reasons: ["valid", "   "] }),
+        knownEvidenceIdsFromInput()
+      )
+    ).toThrow(/likely_culprit_reasons_required/);
+  });
+
+  it("rejects a culprit whose sha doesn't match any suspectedRegression", () => {
+    // Manual construction to bypass builder-side filtering.
+    const packet = packetWithCulprit();
+    if (packet.repoContext?.likelyCulprit) {
+      packet.repoContext.likelyCulprit = {
+        sha: "orphan-sha",
+        confidence: "high",
+        reasons: ["test"],
+      };
+    }
+    expect(() =>
+      assertPacketValid(packet, knownEvidenceIdsFromInput())
+    ).toThrow(/likely_culprit_must_match_regression/);
+  });
+});

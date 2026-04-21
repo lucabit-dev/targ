@@ -13,6 +13,7 @@
  */
 
 import type {
+  CommitRef,
   HandoffEvidenceItem,
   HandoffHypothesis,
   HandoffPacket,
@@ -82,7 +83,55 @@ function renderBestRead(packet: HandoffPacket): string {
   }
   lines.push("", wrap(areaLineParts.join(" ")));
 
+  // Phase 2.7: surface the picked culprit (when present) as a one-line
+  // chip right under the affected-area line. Position matters — this is
+  // the first thing a triage agent reads after "where", so it should
+  // immediately answer "what changed" when we have a confident guess.
+  const culpritChip = formatLikelyCulpritChip(packet);
+  if (culpritChip) {
+    lines.push("", culpritChip);
+  }
+
   return lines.join("\n");
+}
+
+/// Renders the `repoContext.likelyCulprit` chip, e.g.:
+///   **Likely culprit:** [#842](.../pull/842) — "fix: payment retry race"
+///     · @alice · 2 days ago _(matches affected area · touched 2/3 files)_
+///
+/// Returns "" when:
+///   - no `repoContext.likelyCulprit` is set (the common case for packets
+///     without a connected GitHub repo, or when no candidate cleared the
+///     scoring threshold);
+///   - the culprit's `sha` doesn't resolve to a `suspectedRegressions[*]`
+///     entry — invariant 11 should have caught this, but the renderer
+///     still degrades gracefully.
+function formatLikelyCulpritChip(packet: HandoffPacket): string {
+  const ctx = packet.repoContext;
+  if (!ctx?.likelyCulprit) return "";
+  const culprit = ctx.likelyCulprit;
+  const matched = ctx.suspectedRegressions?.find((r) => r.sha === culprit.sha);
+  if (!matched) return "";
+
+  const label = matched.prNumber
+    ? `#${matched.prNumber}`
+    : matched.sha.slice(0, 7);
+  const url = buildCommitRefUrl(matched, ctx);
+  const linked = url ? `[${label}](${url})` : label;
+  const when = formatRelativeDate(matched.date);
+
+  // Confidence label is human-friendly: "high"/"medium" feel clinical.
+  const confidenceWord =
+    culprit.confidence === "high" ? "Likely culprit" : "Possible culprit";
+
+  // Reasons get joined with ` · ` and italicised so they read as a
+  // rationale chip rather than the main statement. Trim the bullet list
+  // to keep the chip a single visual line in most cases.
+  const reasons = culprit.reasons.slice(0, 3).join(" \u00b7 ");
+
+  return wrap(
+    `**${confidenceWord}:** ${linked} — "${matched.message}" \u00b7 @${matched.author} \u00b7 ${when} _(${reasons})_`
+  );
 }
 
 /// Compact inline blame suffix, e.g. `(@alice · #842 · 2d ago)`. Used in
@@ -275,7 +324,16 @@ function renderRepoContext(packet: HandoffPacket): string {
   if (ctx.suspectedRegressions && ctx.suspectedRegressions.length > 0) {
     lines.push("- Suspected recent regressions:");
     for (const commit of ctx.suspectedRegressions) {
-      lines.push(`  - ${formatSuspectedRegressionBullet(commit, ctx)}`);
+      const isCulprit = ctx.likelyCulprit?.sha === commit.sha;
+      const bullet = formatSuspectedRegressionBullet(commit, ctx);
+      // Mark the culprit row so the receiver who scrolls down to the
+      // regressions list can match it back to the chip at the top of the
+      // packet. Suffix is intentionally short — the rationale lives in
+      // the chip, not here.
+      const suffix = isCulprit
+        ? ` ← **likely culprit (${ctx.likelyCulprit?.confidence})**`
+        : "";
+      lines.push(`  - ${bullet}${suffix}`);
     }
   }
   return ["## Repo context", "", lines.join("\n")].join("\n");
@@ -290,11 +348,7 @@ function renderRepoContext(packet: HandoffPacket): string {
 /// by `·` avoids markdown parser ambiguity when the message itself contains
 /// punctuation.
 function formatSuspectedRegressionBullet(
-  commit: NonNullable<HandoffPacket["repoContext"]>["suspectedRegressions"] extends
-    | ReadonlyArray<infer C>
-    | undefined
-    ? C
-    : never,
+  commit: CommitRef,
   ctx: NonNullable<HandoffPacket["repoContext"]>
 ): string {
   const label = commit.prNumber
@@ -315,11 +369,7 @@ function formatSuspectedRegressionBullet(
 }
 
 function buildCommitRefUrl(
-  commit: NonNullable<HandoffPacket["repoContext"]>["suspectedRegressions"] extends
-    | ReadonlyArray<infer C>
-    | undefined
-    ? C
-    : never,
+  commit: CommitRef,
   ctx: NonNullable<HandoffPacket["repoContext"]>
 ): string | null {
   // Prefer the PR URL when we have one — it's the most human-readable entry

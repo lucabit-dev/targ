@@ -610,6 +610,122 @@ describe("loadRepoEnrichmentForCase", () => {
     expect(getBlameMock).toHaveBeenCalledTimes(1);
   });
 
+  // ---------------------------------------------------------------------
+  // Phase 2.7 — likely-culprit detection
+  // ---------------------------------------------------------------------
+
+  it("populates likelyCulprit when a regression strongly matches the affected area", async () => {
+    primeEnrichedCase();
+    githubAccountFindUnique.mockResolvedValueOnce({
+      accessTokenEnc: "encrypted-blob",
+    });
+    getBlameMock.mockResolvedValueOnce(
+      singleRangeBlame({
+        sha: "winner-sha",
+        message: "fix: handle null in checkout flow (#842)",
+        authorLogin: "alice",
+      })
+    );
+    listCommitsMock.mockResolvedValueOnce([
+      {
+        sha: "winner-sha",
+        message: "fix: handle null in checkout flow (#842)",
+        authorLogin: "alice",
+        authorName: "Alice",
+        authorEmail: null,
+        date: new Date(Date.now() - 86_400_000).toISOString(),
+        htmlUrl: "https://github.com/acme/checkout/commit/winner-sha",
+      },
+    ]);
+
+    // Override the diagnosis affectedArea with a string the commit will
+    // strongly match (multiple shared keywords → high score).
+    const input = sampleInput();
+    input.diagnosis = diagnosisVM({
+      affectedArea: "checkout flow null handler",
+      probableRootCause: "missing null guard in checkout",
+    });
+
+    const result = await loadRepoEnrichmentForCase({
+      userId: "u1",
+      caseId: "case-1",
+      input,
+    });
+
+    expect(result?.likelyCulprit).toBeDefined();
+    expect(result?.likelyCulprit?.sha).toBe("winner-sha");
+    expect(["high", "medium"]).toContain(result?.likelyCulprit?.confidence);
+    expect(result?.likelyCulprit?.reasons.length).toBeGreaterThan(0);
+  });
+
+  it("omits likelyCulprit when no regression clears the medium threshold", async () => {
+    primeEnrichedCase();
+    githubAccountFindUnique.mockResolvedValueOnce({
+      accessTokenEnc: "encrypted-blob",
+    });
+    getBlameMock.mockResolvedValueOnce(
+      singleRangeBlame({
+        sha: "noise",
+        message: "chore: bump dependency versions",
+        authorLogin: "carol",
+      })
+    );
+    // Make the regression touch a file the resolver did NOT pick up, and
+    // give it a totally unrelated message → score should be near zero.
+    listCommitsMock.mockResolvedValueOnce([
+      {
+        sha: "noise",
+        message: "chore: bump dependency versions",
+        authorLogin: "carol",
+        authorName: "Carol",
+        authorEmail: null,
+        // Inside the 30-day regression window so it's still listed as a
+        // suspected regression, but outside the 7-day culprit recency
+        // window so recency alone doesn't push it past the threshold.
+        date: new Date(Date.now() - 86_400_000 * 20).toISOString(),
+        htmlUrl: "https://github.com/acme/checkout/commit/noise",
+      },
+    ]);
+
+    const input = sampleInput();
+    input.diagnosis = diagnosisVM({
+      // No keyword overlap with the commit message ("bump dependency
+      // versions") and no resolved-file overlap → score = 0.
+      affectedArea: "completely unrelated subsystem",
+      probableRootCause: "something else entirely",
+    });
+
+    const result = await loadRepoEnrichmentForCase({
+      userId: "u1",
+      caseId: "case-1",
+      input,
+    });
+
+    expect(result?.suspectedRegressions).toBeDefined();
+    expect(result?.likelyCulprit).toBeUndefined();
+  });
+
+  it("does not run culprit detection when there are no suspected regressions", async () => {
+    primeEnrichedCase();
+    githubAccountFindUnique.mockResolvedValueOnce({
+      accessTokenEnc: "encrypted-blob",
+    });
+    getBlameMock.mockResolvedValueOnce(
+      singleRangeBlame({ sha: "x", message: "y", authorLogin: "z" })
+    );
+    // Empty list → no regressions populated → no culprit.
+    listCommitsMock.mockResolvedValueOnce([]);
+
+    const result = await loadRepoEnrichmentForCase({
+      userId: "u1",
+      caseId: "case-1",
+      input: sampleInput(),
+    });
+
+    expect(result?.suspectedRegressions).toBeUndefined();
+    expect(result?.likelyCulprit).toBeUndefined();
+  });
+
   it("falls back to file-level blame when the line is outside all ranges", async () => {
     primeEnrichedCase();
     githubAccountFindUnique.mockResolvedValueOnce({

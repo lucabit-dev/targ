@@ -29,6 +29,7 @@ import {
   type BlameCommit,
   type BlameContext,
 } from "@/lib/handoff/blame-enrichment";
+import { detectLikelyCulpritFromEnrichment } from "@/lib/handoff/culprit-detection";
 import type { HandoffPacketInput, RepoEnrichmentInput } from "@/lib/handoff/packet";
 import {
   enrichPacketInput,
@@ -160,11 +161,62 @@ export async function loadRepoEnrichmentForCase(
   // enrichment. This hits GitHub's list-commits API per unique file, so it
   // only runs when the user has a connected GitHub account; any failure
   // falls back to the pre-2.5 enrichment without throwing.
-  return applyBlameEnrichment({
+  const blameEnriched = await applyBlameEnrichment({
     userId: params.userId,
     repoLink,
     baseEnrichment,
   });
+
+  // Phase 2.7: pure scoring pass over the regressions list to pick the
+  // most-likely culprit. Runs in-process (no I/O), so it's safe to apply
+  // unconditionally — it just no-ops when there are no regressions or no
+  // candidate clears the medium threshold.
+  return applyCulpritDetection({
+    enrichment: blameEnriched,
+    input: params.input,
+  });
+}
+
+/// Pure scoring layer (Phase 2.7) that picks the most-likely-culprit
+/// commit from `enrichment.suspectedRegressions` by cross-referencing the
+/// LLM's affectedArea / probableRootCause / summary against each commit's
+/// message + touched files. Always synchronous from a network perspective
+/// — runs in-process against data already loaded.
+function applyCulpritDetection(params: {
+  enrichment: RepoEnrichmentInput;
+  input: HandoffPacketInput;
+}): RepoEnrichmentInput {
+  const { enrichment, input } = params;
+  // No regressions → no culprit. Cheap exit before any tokenization.
+  if (
+    !enrichment.suspectedRegressions ||
+    enrichment.suspectedRegressions.length === 0
+  ) {
+    return enrichment;
+  }
+
+  try {
+    const result = detectLikelyCulpritFromEnrichment(enrichment, {
+      affectedArea: input.diagnosis.affectedArea,
+      probableRootCause: input.diagnosis.probableRootCause,
+      summary: input.diagnosis.summary,
+    });
+    if (process.env.NODE_ENV !== "production") {
+      console.info(`${LOG_PREFIX} culprit detection`, {
+        topScore: result.topScore,
+        picked: result.culprit?.sha ?? null,
+        confidence: result.culprit?.confidence ?? null,
+        runnerUp: result.runnerUpSha,
+      });
+    }
+    if (!result.culprit) return enrichment;
+    return { ...enrichment, likelyCulprit: result.culprit };
+  } catch (error) {
+    // Pure scoring shouldn't throw, but a defensive try/catch keeps the
+    // packet shipping if a future change introduces a bug here.
+    console.warn(`${LOG_PREFIX} culprit detection threw`, error);
+    return enrichment;
+  }
 }
 
 async function applyBlameEnrichment(params: {
