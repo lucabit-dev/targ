@@ -85,7 +85,12 @@ describe("tokenize", () => {
 describe("detectLikelyCulprit", () => {
   it("returns null when there are no regressions", () => {
     const result = detectLikelyCulprit([], { affectedArea: "checkout" });
-    expect(result).toEqual({ culprit: null, topScore: 0, runnerUpSha: null });
+    expect(result).toEqual({
+      culprit: null,
+      topScore: 0,
+      runnerUpSha: null,
+      topCandidateShas: [],
+    });
   });
 
   it("returns null when no candidate clears the medium threshold", () => {
@@ -362,6 +367,53 @@ describe("detectLikelyCulprit — scoring", () => {
     expect(result.culprit).toBeNull();
     expect(result.topScore).toBeLessThan(2);
     expect(result.runnerUpSha).toBeTruthy();
+  });
+
+  it("exposes topCandidateShas ordered by score for diff-aware reranking", () => {
+    // Winner and runner-up with clearly different scores. The order
+    // should be [winner, runner-up, ...].
+    const winner = commit({
+      sha: "winner",
+      message: "fix: checkout submit",
+      touchedFiles: ["src/checkout.ts"],
+      date: "2026-04-19T00:00:00Z",
+    });
+    const runnerUp = commit({
+      sha: "runnerup",
+      message: "refactor: checkout",
+      touchedFiles: ["src/checkout.ts"],
+      date: "2026-04-18T00:00:00Z",
+    });
+    const noise = commit({
+      sha: "noise",
+      message: "chore: bump",
+      date: "2026-04-17T00:00:00Z",
+    });
+    const result = detectLikelyCulprit([noise, runnerUp, winner], {
+      affectedArea: "checkout submit",
+      resolvedFiles: ["src/checkout.ts"],
+      now: NOW,
+    });
+    expect(result.topCandidateShas[0]).toBe("winner");
+    expect(result.topCandidateShas[1]).toBe("runnerup");
+    expect(result.topCandidateShas).toContain("noise");
+  });
+
+  it("caps topCandidateShas at 5 to bound downstream fan-out", () => {
+    const commits = Array.from({ length: 10 }, (_, i) =>
+      commit({
+        sha: `c${i}`,
+        message: "fix: checkout",
+        touchedFiles: ["src/checkout.ts"],
+        date: `2026-04-${10 + i}T00:00:00Z`,
+      })
+    );
+    const result = detectLikelyCulprit(commits, {
+      affectedArea: "checkout",
+      resolvedFiles: ["src/checkout.ts"],
+      now: NOW,
+    });
+    expect(result.topCandidateShas.length).toBeLessThanOrEqual(5);
   });
 });
 
@@ -856,5 +908,176 @@ describe("detectLikelyCulprit — negative evidence", () => {
       now: NOW,
     });
     expect(result.culprit?.confidence).toBe("medium");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 2.9 — diff-aware signal
+// ---------------------------------------------------------------------------
+
+describe("detectLikelyCulprit — diff-aware signal", () => {
+  it("awards bonus + reason when a commit's diff touches a stack-frame line", () => {
+    const target = commit({
+      sha: "target",
+      message: "fix: checkout",
+      touchedFiles: ["src/checkout.ts"],
+      date: "2026-04-19T00:00:00Z",
+    });
+    // Probe returns true for line 42 on the resolved file — simulates
+    // the diff hunk covering that line.
+    const probe = (file: string, line: number) =>
+      file === "src/checkout.ts" && line === 42;
+
+    const result = detectLikelyCulprit([target], {
+      affectedArea: "checkout",
+      resolvedFiles: ["src/checkout.ts"],
+      stackLines: [{ file: "src/checkout.ts", line: 42 }],
+      diffProbesBySha: new Map([["target", probe]]),
+      now: NOW,
+    });
+    expect(result.culprit?.sha).toBe("target");
+    expect(result.culprit?.reasons).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("diff touches src/checkout.ts:42"),
+      ])
+    );
+  });
+
+  it("flips the pick when the runner-up's diff hits a stack line and leader's doesn't", () => {
+    // Both commits touch the same file + match the area. Leader has
+    // slightly more recency, but runner-up's diff is the one that
+    // actually modifies the crashing line. The diff signal should
+    // promote the runner-up to top.
+    const leader = commit({
+      sha: "leader",
+      message: "refactor: checkout flow",
+      touchedFiles: ["src/checkout.ts"],
+      date: "2026-04-19T12:00:00Z", // 0.5 days ago
+    });
+    const truth = commit({
+      sha: "truth",
+      message: "fix: checkout",
+      touchedFiles: ["src/checkout.ts"],
+      date: "2026-04-17T00:00:00Z", // 3 days ago
+    });
+    // Only truth's diff touches line 42.
+    const probes = new Map<
+      string,
+      (f: string, l: number) => boolean
+    >([
+      ["leader", () => false],
+      ["truth", (f, l) => f === "src/checkout.ts" && l === 42],
+    ]);
+
+    const result = detectLikelyCulprit([leader, truth], {
+      affectedArea: "checkout flow",
+      resolvedFiles: ["src/checkout.ts"],
+      stackLines: [{ file: "src/checkout.ts", line: 42 }],
+      diffProbesBySha: probes,
+      now: NOW,
+    });
+    expect(result.culprit?.sha).toBe("truth");
+  });
+
+  it("no-ops when no diff probes are supplied (Phase <2.9 behaviour preserved)", () => {
+    const c = commit({
+      sha: "x",
+      message: "fix: checkout",
+      touchedFiles: ["src/checkout.ts"],
+      date: "2026-04-19T00:00:00Z",
+    });
+    const result = detectLikelyCulprit([c], {
+      affectedArea: "checkout",
+      resolvedFiles: ["src/checkout.ts"],
+      stackLines: [{ file: "src/checkout.ts", line: 42 }],
+      // No diffProbesBySha → diff signal inactive.
+      now: NOW,
+    });
+    expect(
+      result.culprit?.reasons.every((r) => !r.includes("diff touches"))
+    ).toBe(true);
+  });
+
+  it("ignores stack lines with non-finite or non-positive line numbers", () => {
+    // Defense: the resolver occasionally produces stack locations
+    // without a usable line (path-only entries). Those must not
+    // trigger false bonuses.
+    const c = commit({
+      sha: "x",
+      message: "fix",
+      touchedFiles: ["src/a.ts"],
+      date: "2026-04-19T00:00:00Z",
+    });
+    // Probe that claims "touches everything" — if invalid lines reach
+    // it, we'd incorrectly credit the bonus.
+    const probe = () => true;
+    const result = detectLikelyCulprit([c], {
+      affectedArea: "irrelevant",
+      stackLines: [
+        { file: "src/a.ts", line: 0 },
+        { file: "src/a.ts", line: -1 },
+        { file: "src/a.ts", line: Number.NaN },
+      ],
+      diffProbesBySha: new Map([["x", probe]]),
+      now: NOW,
+    });
+    expect(
+      result.culprit === null ||
+        result.culprit.reasons.every((r) => !r.includes("diff touches"))
+    ).toBe(true);
+  });
+
+  it("credits only one bonus per commit even when multiple stack lines hit", () => {
+    const c = commit({
+      sha: "x",
+      message: "fix: checkout",
+      touchedFiles: ["src/a.ts"],
+      date: "2026-04-19T00:00:00Z",
+    });
+    const probe = () => true; // every line hits
+    const result = detectLikelyCulprit([c], {
+      affectedArea: "checkout",
+      stackLines: [
+        { file: "src/a.ts", line: 10 },
+        { file: "src/a.ts", line: 20 },
+        { file: "src/a.ts", line: 30 },
+      ],
+      diffProbesBySha: new Map([["x", probe]]),
+      now: NOW,
+    });
+    const diffReasons =
+      result.culprit?.reasons.filter((r) => r.includes("diff touches")) ?? [];
+    // Only one "diff touches" reason — the scorer must not emit three.
+    expect(diffReasons.length).toBe(1);
+    // And it should name the FIRST hit for determinism.
+    expect(diffReasons[0]).toContain("src/a.ts:10");
+  });
+
+  it("commits without a probe entry are unaffected by diff signal", () => {
+    const probed = commit({
+      sha: "probed",
+      message: "fix: checkout",
+      touchedFiles: ["src/a.ts"],
+      date: "2026-04-19T00:00:00Z",
+    });
+    const unprobed = commit({
+      sha: "unprobed",
+      message: "fix: checkout",
+      touchedFiles: ["src/a.ts"],
+      date: "2026-04-19T00:00:00Z",
+    });
+    const probes = new Map<
+      string,
+      (f: string, l: number) => boolean
+    >([["probed", () => true]]);
+    const result = detectLikelyCulprit([probed, unprobed], {
+      affectedArea: "checkout",
+      stackLines: [{ file: "src/a.ts", line: 42 }],
+      diffProbesBySha: probes,
+      now: NOW,
+    });
+    // Probed wins because of the diff bonus — unprobed has identical
+    // raw signal minus the 2-point hit bonus.
+    expect(result.culprit?.sha).toBe("probed");
   });
 });

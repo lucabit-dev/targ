@@ -29,17 +29,23 @@ import {
   type BlameCommit,
   type BlameContext,
 } from "@/lib/handoff/blame-enrichment";
-import { detectLikelyCulpritFromEnrichment } from "@/lib/handoff/culprit-detection";
+import {
+  detectLikelyCulpritFromEnrichment,
+  type CommitDiffProbe,
+} from "@/lib/handoff/culprit-detection";
 import type { HandoffPacketInput, RepoEnrichmentInput } from "@/lib/handoff/packet";
 import {
   enrichPacketInput,
   type EnrichmentContext,
 } from "@/lib/handoff/repo-enrichment";
 import {
+  diffTouchesLine,
+  getCommitDiff,
   getFileBlameRanges,
   GithubApiError,
   listCommitsForPath,
   type GithubBlameResult,
+  type GithubCommitDiff,
   type GithubCommitSummary,
 } from "@/lib/github/client";
 import { prisma } from "@/lib/prisma";
@@ -76,6 +82,24 @@ const BLAME_CONCURRENCY = 3;
 /// whole handoff waits, so fail fast and let the packet ship without that
 /// file's blame.
 const BLAME_FETCH_TIMEOUT_MS = 4_000;
+
+// ---------------------------------------------------------------------------
+// Diff-aware rerank tunables (Phase 2.9)
+// ---------------------------------------------------------------------------
+
+/// How many top candidates to fetch diffs for. Two is the cheapest
+/// useful setting: it confirms the leader OR promotes the runner-up
+/// when its diff actually touches the crashing line. Raising this is
+/// strictly more expensive (one GitHub call per additional commit).
+const DIFF_AWARE_TOP_K = 2;
+
+/// Hard ceiling on parallel diff fetches. Diffs are per-commit and
+/// GitHub caches them well; low concurrency is fine.
+const DIFF_AWARE_CONCURRENCY = 2;
+
+/// Per-commit diff fetch timeout. Diffs on large commits can be slow —
+/// fail fast so the rest of the packet still ships.
+const DIFF_AWARE_FETCH_TIMEOUT_MS = 5_000;
 
 const LOG_PREFIX = "[handoff-enrichment]";
 
@@ -167,26 +191,44 @@ export async function loadRepoEnrichmentForCase(
     baseEnrichment,
   });
 
-  // Phase 2.7: pure scoring pass over the regressions list to pick the
-  // most-likely culprit. Runs in-process (no I/O), so it's safe to apply
-  // unconditionally — it just no-ops when there are no regressions or no
-  // candidate clears the medium threshold.
+  // Phase 2.7 + 2.9: scoring pass over the regressions list to pick the
+  // most-likely culprit. First pass is pure (in-process). When the
+  // first pass surfaces viable candidates AND we have resolved stack
+  // lines AND a GitHub token, we fetch diffs for the top-K candidates
+  // and rerun detection with a diff-aware bonus for commits whose diff
+  // actually modifies a stack-frame line. Any failure in the diff pass
+  // falls back to the first-pass result.
   return applyCulpritDetection({
     enrichment: blameEnriched,
     input: params.input,
+    userId: params.userId,
+    repoLink,
   });
 }
 
-/// Pure scoring layer (Phase 2.7) that picks the most-likely-culprit
-/// commit from `enrichment.suspectedRegressions` by cross-referencing the
-/// LLM's affectedArea / probableRootCause / summary against each commit's
-/// message + touched files. Always synchronous from a network perspective
-/// — runs in-process against data already loaded.
-function applyCulpritDetection(params: {
+/// Scoring layer (Phase 2.7 + 2.9) that picks the most-likely-culprit
+/// commit from `enrichment.suspectedRegressions`. Runs as a two-pass
+/// pipeline:
+///
+///   1. CHEAP pass — pure, in-process. Cross-references the LLM's
+///      affectedArea / probableRootCause / summary against each
+///      commit's message + touched files + contradiction scope. No
+///      I/O. Produces an initial ranking AND the list of top
+///      candidates worth the more expensive second pass.
+///
+///   2. PRECISION pass (Phase 2.9) — fetches the actual diff for the
+///      top-K candidates and reranks with a diff-aware bonus when a
+///      commit's diff hunks cover a line from the evidence stack
+///      frames. Skipped when: no resolved stack lines, no GitHub
+///      token, no first-pass candidates, or all diff fetches fail.
+///      Any failure in this pass falls back to the first-pass result.
+async function applyCulpritDetection(params: {
   enrichment: RepoEnrichmentInput;
   input: HandoffPacketInput;
-}): RepoEnrichmentInput {
-  const { enrichment, input } = params;
+  userId: string;
+  repoLink: PickedRepoLink["repoLink"];
+}): Promise<RepoEnrichmentInput> {
+  const { enrichment, input, userId, repoLink } = params;
   // No regressions → no culprit. Cheap exit before any tokenization.
   if (
     !enrichment.suspectedRegressions ||
@@ -195,31 +237,200 @@ function applyCulpritDetection(params: {
     return enrichment;
   }
 
+  const baseSignals = {
+    affectedArea: input.diagnosis.affectedArea,
+    probableRootCause: input.diagnosis.probableRootCause,
+    summary: input.diagnosis.summary,
+    // Phase 2.8: contradictions feed the negative-evidence layer.
+    contradictions: input.diagnosis.contradictions,
+  };
+
+  let firstPass;
   try {
-    const result = detectLikelyCulpritFromEnrichment(enrichment, {
-      affectedArea: input.diagnosis.affectedArea,
-      probableRootCause: input.diagnosis.probableRootCause,
-      summary: input.diagnosis.summary,
-      // Phase 2.8: contradictions feed the negative-evidence layer.
-      // They trigger scope-exclusion penalties ("Only on iOS" → demote
-      // android-only commits) and nudge the confidence cap to medium.
-      contradictions: input.diagnosis.contradictions,
+    firstPass = detectLikelyCulpritFromEnrichment(enrichment, baseSignals);
+  } catch (error) {
+    console.warn(`${LOG_PREFIX} culprit detection (first pass) threw`, error);
+    return enrichment;
+  }
+  if (process.env.NODE_ENV !== "production") {
+    console.info(`${LOG_PREFIX} culprit detection (first pass)`, {
+      topScore: firstPass.topScore,
+      picked: firstPass.culprit?.sha ?? null,
+      confidence: firstPass.culprit?.confidence ?? null,
+      runnerUp: firstPass.runnerUpSha,
+      topCandidates: firstPass.topCandidateShas.slice(0, 3),
     });
+  }
+
+  // Phase 2.9 — try the diff-aware rerank. Short-circuit back to the
+  // first-pass result if any of the required inputs is missing; this
+  // preserves Phase 2.7 behaviour for packets without stack lines or
+  // without a connected GitHub account.
+  const stackLines = collectResolvedStackLines(enrichment);
+  const topShas = firstPass.topCandidateShas.slice(0, DIFF_AWARE_TOP_K);
+  if (stackLines.length === 0 || topShas.length === 0) {
+    return finaliseCulprit(enrichment, firstPass.culprit);
+  }
+
+  const diffProbesBySha = await fetchDiffProbes({
+    userId,
+    repoLink,
+    shas: topShas,
+  });
+  if (diffProbesBySha.size === 0) {
+    // No usable diffs → keep first-pass pick.
+    return finaliseCulprit(enrichment, firstPass.culprit);
+  }
+
+  let secondPass;
+  try {
+    secondPass = detectLikelyCulpritFromEnrichment(enrichment, {
+      ...baseSignals,
+      stackLines,
+      diffProbesBySha,
+    });
+  } catch (error) {
+    console.warn(`${LOG_PREFIX} culprit detection (second pass) threw`, error);
+    return finaliseCulprit(enrichment, firstPass.culprit);
+  }
+
+  if (process.env.NODE_ENV !== "production") {
+    const flipped =
+      firstPass.culprit?.sha !== undefined &&
+      secondPass.culprit?.sha !== undefined &&
+      firstPass.culprit.sha !== secondPass.culprit.sha;
+    console.info(`${LOG_PREFIX} culprit detection (second pass)`, {
+      diffsFetched: diffProbesBySha.size,
+      picked: secondPass.culprit?.sha ?? null,
+      confidence: secondPass.culprit?.confidence ?? null,
+      flippedFromFirstPass: flipped,
+    });
+  }
+
+  return finaliseCulprit(enrichment, secondPass.culprit);
+}
+
+function finaliseCulprit(
+  enrichment: RepoEnrichmentInput,
+  culprit: RepoEnrichmentInput["likelyCulprit"] | null
+): RepoEnrichmentInput {
+  if (!culprit) return enrichment;
+  return { ...enrichment, likelyCulprit: culprit };
+}
+
+/// Harvests (file, line) pairs from the already-resolved stack
+/// locations. Only entries with a finite, positive `line` are useful
+/// for diff-aware matching — path-only locations can't hit a hunk
+/// range, so we skip them up front rather than pushing that work
+/// into the scorer.
+function collectResolvedStackLines(
+  enrichment: RepoEnrichmentInput
+): Array<{ file: string; line: number }> {
+  const out: Array<{ file: string; line: number }> = [];
+  const seen = new Set<string>();
+  for (const loc of enrichment.stackLocations ?? []) {
+    if (!loc.line || !Number.isFinite(loc.line) || loc.line <= 0) continue;
+    const key = `${loc.file}:${loc.line}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ file: loc.file, line: loc.line });
+  }
+  // Also pull from per-evidence locations — stack frames embedded in
+  // a specific log/paste may not have been aggregated into
+  // `stackLocations` if they only appeared once.
+  for (const list of Object.values(enrichment.evidenceLocations ?? {})) {
+    for (const loc of list) {
+      if (!loc.line || !Number.isFinite(loc.line) || loc.line <= 0) continue;
+      const key = `${loc.file}:${loc.line}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ file: loc.file, line: loc.line });
+    }
+  }
+  return out;
+}
+
+/// Fetches commit diffs for the supplied SHAs, wraps each in a
+/// `CommitDiffProbe` closure, and returns the populated map. Commits
+/// that fail to fetch (network, timeout, truncated beyond the 1MB
+/// cap) are simply omitted — they'll get no diff bonus, which is
+/// correct: we can't tell whether they touched the line.
+async function fetchDiffProbes(params: {
+  userId: string;
+  repoLink: PickedRepoLink["repoLink"];
+  shas: string[];
+}): Promise<Map<string, CommitDiffProbe>> {
+  const probes = new Map<string, CommitDiffProbe>();
+  if (params.shas.length === 0) return probes;
+
+  let token: string | null = null;
+  try {
+    token = await getDecryptedAccessToken(params.userId);
+  } catch (error) {
+    console.warn(`${LOG_PREFIX} diff probe token lookup failed`, error);
+  }
+  if (!token) return probes;
+
+  // Bounded concurrency. Pull SHAs off a shared cursor so workers
+  // drain the queue without us having to chunk manually.
+  const cursor = { i: 0 };
+  const worker = async () => {
+    while (true) {
+      const idx = cursor.i++;
+      if (idx >= params.shas.length) return;
+      const sha = params.shas[idx];
+      const diff = await fetchDiffOne({
+        token: token!,
+        repoLink: params.repoLink,
+        sha,
+      });
+      if (diff) {
+        probes.set(sha, (file: string, line: number) =>
+          diffTouchesLine(diff, file, line)
+        );
+      }
+    }
+  };
+  const workers = Array.from(
+    { length: Math.min(DIFF_AWARE_CONCURRENCY, params.shas.length) },
+    () => worker()
+  );
+  await Promise.all(workers);
+  return probes;
+}
+
+async function fetchDiffOne(params: {
+  token: string;
+  repoLink: PickedRepoLink["repoLink"];
+  sha: string;
+}): Promise<GithubCommitDiff | null> {
+  // Race the fetch against a hard timeout so a single slow commit
+  // can't delay the whole packet. On timeout we return null and the
+  // scorer simply skips the diff bonus for this commit.
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), DIFF_AWARE_FETCH_TIMEOUT_MS);
+  });
+  const fetchPromise = getCommitDiff(
+    params.token,
+    params.repoLink.ownerLogin,
+    params.repoLink.repoName,
+    params.sha
+  ).catch((error) => {
     if (process.env.NODE_ENV !== "production") {
-      console.info(`${LOG_PREFIX} culprit detection`, {
-        topScore: result.topScore,
-        picked: result.culprit?.sha ?? null,
-        confidence: result.culprit?.confidence ?? null,
-        runnerUp: result.runnerUpSha,
+      const status =
+        error instanceof GithubApiError ? error.status : "unknown";
+      console.info(`${LOG_PREFIX} diff fetch skipped`, {
+        sha: params.sha,
+        status,
       });
     }
-    if (!result.culprit) return enrichment;
-    return { ...enrichment, likelyCulprit: result.culprit };
-  } catch (error) {
-    // Pure scoring shouldn't throw, but a defensive try/catch keeps the
-    // packet shipping if a future change introduces a bug here.
-    console.warn(`${LOG_PREFIX} culprit detection threw`, error);
-    return enrichment;
+    return null;
+  });
+  try {
+    return await Promise.race([fetchPromise, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 

@@ -579,6 +579,184 @@ export async function getFileBlameRanges(
   return { ranges, mostRecentCommit };
 }
 
+// ---------------------------------------------------------------------------
+// REST — commit diff (Phase 2.9)
+// ---------------------------------------------------------------------------
+
+/// One contiguous hunk inside a file's unified diff. `newStart` /
+/// `newLines` describe the affected range in the POST-change file (what
+/// a stack trace would reference); `oldStart` / `oldLines` describe the
+/// PRE-change range (useful for "this line USED to be here" reasoning).
+export type GithubDiffHunk = {
+  oldStart: number;
+  oldLines: number;
+  newStart: number;
+  newLines: number;
+};
+
+export type GithubDiffFileStatus =
+  | "added"
+  | "modified"
+  | "removed"
+  | "renamed"
+  | "copied"
+  | "changed"
+  | "unchanged";
+
+export type GithubDiffFile = {
+  path: string;
+  /// For renames/copies, the pre-change path. `null` otherwise.
+  previousPath: string | null;
+  status: GithubDiffFileStatus;
+  additions: number;
+  deletions: number;
+  hunks: GithubDiffHunk[];
+};
+
+export type GithubCommitDiff = {
+  sha: string;
+  files: GithubDiffFile[];
+  /// `true` when the upstream response omitted `patch` on one or more
+  /// files (e.g. GitHub's 1MB diff cap, binary files, or very large
+  /// commits). Callers can treat this as "diff-aware signal is
+  /// incomplete for this commit" and degrade gracefully.
+  truncated: boolean;
+};
+
+type GithubCommitDetailApi = {
+  sha: string;
+  files?: Array<{
+    filename: string;
+    previous_filename?: string | null;
+    status: string;
+    additions?: number;
+    deletions?: number;
+    patch?: string;
+  }>;
+};
+
+/// Parses a GitHub unified-diff `patch` string into hunk ranges. The
+/// `patch` field omits the file-level `---` / `+++` headers and begins
+/// with the first `@@ ... @@` hunk, which is the shape we care about.
+///
+/// Returns an empty array for binary files, missing patches, or
+/// malformed input. The caller distinguishes "no hunks" from "file not
+/// in diff" via the enclosing file list.
+export function parseUnifiedDiffHunks(patch: string | undefined): GithubDiffHunk[] {
+  if (!patch) return [];
+  const hunks: GithubDiffHunk[] = [];
+  // Hunk header shape: `@@ -oldStart[,oldLines] +newStart[,newLines] @@ ...`
+  // Line counts default to 1 when omitted (single-line change).
+  const re = /^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@/gm;
+  for (let m; (m = re.exec(patch)) !== null; ) {
+    const oldStart = Number(m[1]);
+    const oldLines = m[2] !== undefined ? Number(m[2]) : 1;
+    const newStart = Number(m[3]);
+    const newLines = m[4] !== undefined ? Number(m[4]) : 1;
+    if (
+      !Number.isFinite(oldStart) ||
+      !Number.isFinite(newStart) ||
+      !Number.isFinite(oldLines) ||
+      !Number.isFinite(newLines)
+    ) {
+      continue;
+    }
+    hunks.push({ oldStart, oldLines, newStart, newLines });
+  }
+  return hunks;
+}
+
+/// Narrows a raw upstream `status` string to our typed enum. GitHub
+/// documents six canonical values but historically emits others (e.g.
+/// "unchanged" for files with mode-only changes), so unknown values
+/// fall back to `"changed"` rather than throwing.
+function normalizeDiffStatus(raw: string): GithubDiffFileStatus {
+  switch (raw) {
+    case "added":
+    case "modified":
+    case "removed":
+    case "renamed":
+    case "copied":
+    case "changed":
+    case "unchanged":
+      return raw;
+    default:
+      return "changed";
+  }
+}
+
+/// Fetches a commit's full detail including per-file diffs, parses
+/// hunk headers, and returns the structured result. Used by the
+/// Phase 2.9 diff-aware rerank pass — callers typically invoke this
+/// only for the top-K initial culprit candidates to keep API cost
+/// bounded (K=2 in the current service wiring).
+export async function getCommitDiff(
+  token: string,
+  owner: string,
+  name: string,
+  sha: string
+): Promise<GithubCommitDiff> {
+  const response = await githubFetch(
+    `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/commits/${encodeURIComponent(sha)}`,
+    { token }
+  );
+  const raw = (await response.json()) as GithubCommitDetailApi;
+  const rawFiles = raw.files ?? [];
+  let truncated = false;
+  const files: GithubDiffFile[] = rawFiles.map((f) => {
+    const hunks = parseUnifiedDiffHunks(f.patch);
+    // No `patch` on a non-removed file usually means the upstream
+    // response truncated the diff (binary, too large, rename-only).
+    // Removed/renamed files legitimately may have no patch — don't
+    // flag those.
+    if (
+      !f.patch &&
+      f.status !== "removed" &&
+      f.status !== "renamed" &&
+      f.status !== "copied" &&
+      f.status !== "unchanged"
+    ) {
+      truncated = true;
+    }
+    return {
+      path: f.filename,
+      previousPath: f.previous_filename ?? null,
+      status: normalizeDiffStatus(f.status),
+      additions: f.additions ?? 0,
+      deletions: f.deletions ?? 0,
+      hunks,
+    };
+  });
+  return { sha: raw.sha ?? sha, files, truncated };
+}
+
+/// Tests whether a commit's diff touches a specific (file, line) pair
+/// on the post-change side. Used by the Phase 2.9 scoring bonus. A
+/// "touch" means any hunk in the file's diff covers `line` within its
+/// `[newStart, newStart + newLines)` range. Renamed files match on
+/// either the new or previous path so a stack frame pointing at the
+/// old location still resolves.
+export function diffTouchesLine(
+  diff: GithubCommitDiff,
+  file: string,
+  line: number
+): boolean {
+  if (!Number.isFinite(line) || line <= 0) return false;
+  for (const f of diff.files) {
+    if (f.path !== file && f.previousPath !== file) continue;
+    for (const h of f.hunks) {
+      // `newLines === 0` means the hunk is a pure deletion — it
+      // doesn't cover any post-change line, so a stack frame pointing
+      // at the new file can't land inside it.
+      if (h.newLines === 0) continue;
+      if (line >= h.newStart && line < h.newStart + h.newLines) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 export type GithubOAuthTokenResponse = {
   accessToken: string;
   refreshToken: string | null;

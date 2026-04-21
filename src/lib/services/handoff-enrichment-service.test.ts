@@ -34,6 +34,10 @@ vi.mock("@/lib/github/client", async () => {
     ...actual,
     listCommitsForPath: vi.fn(),
     getFileBlameRanges: vi.fn(),
+    // Phase 2.9 — diff-aware rerank. Default: every call resolves to
+    // an empty diff so tests that don't care about diffs behave
+    // identically to Phase 2.7.
+    getCommitDiff: vi.fn(),
   };
 });
 
@@ -46,7 +50,11 @@ vi.mock("@/lib/crypto/token-cipher", () => ({
 
 import type { DiagnosisSnapshotViewModel } from "@/lib/analysis/view-model";
 import type { EvidenceViewModel } from "@/lib/evidence/view-model";
-import { getFileBlameRanges, listCommitsForPath } from "@/lib/github/client";
+import {
+  getCommitDiff,
+  getFileBlameRanges,
+  listCommitsForPath,
+} from "@/lib/github/client";
 import type { HandoffPacketInput } from "@/lib/handoff/packet";
 import { prisma } from "@/lib/prisma";
 import {
@@ -65,6 +73,7 @@ const githubAccountFindUnique = prisma.targGithubAccount
   .findUnique as unknown as ReturnType<typeof vi.fn>;
 const listCommitsMock = listCommitsForPath as unknown as ReturnType<typeof vi.fn>;
 const getBlameMock = getFileBlameRanges as unknown as ReturnType<typeof vi.fn>;
+const getCommitDiffMock = getCommitDiff as unknown as ReturnType<typeof vi.fn>;
 const isStaleMock = isRepoSnapshotStale as unknown as ReturnType<typeof vi.fn>;
 const syncTreeMock = syncRepoTree as unknown as ReturnType<typeof vi.fn>;
 
@@ -78,6 +87,11 @@ beforeEach(() => {
   githubAccountFindUnique.mockResolvedValue(null);
   listCommitsMock.mockResolvedValue([]);
   getBlameMock.mockResolvedValue({ ranges: [], mostRecentCommit: null });
+  getCommitDiffMock.mockResolvedValue({
+    sha: "default",
+    files: [],
+    truncated: false,
+  });
 });
 
 // Helper: builds a one-range GraphQL blame response covering a wide line
@@ -806,6 +820,291 @@ describe("loadRepoEnrichmentForCase", () => {
         r.startsWith("but contradicts scope")
       )
     ).toBe(true);
+  });
+
+  // -------------------------------------------------------------------------
+  // Phase 2.9 — diff-aware rerank integration
+  // -------------------------------------------------------------------------
+
+  it("promotes the runner-up when its diff actually modifies the stack-frame line", async () => {
+    // Two regression candidates touching the same file. The "leader"
+    // is slightly more recent (1d ago vs 3d), so the first-pass
+    // scorer prefers it. But the "truth" commit is the one whose
+    // diff covers line 42 — the diff-aware second pass should flip
+    // the pick.
+    caseFindUnique.mockResolvedValueOnce({
+      workspaceId: "ws-1",
+      repoLinkId: "rlink-1",
+    });
+    repoLinkFindUnique.mockResolvedValueOnce(mockRepoLink());
+    repoFileFindMany.mockResolvedValueOnce([mockFile("src/lib/checkout.ts")]);
+    repoSymbolFindMany.mockResolvedValueOnce([]);
+
+    githubAccountFindUnique.mockResolvedValue({
+      accessTokenEnc: "encrypted-blob",
+    });
+    // Blame picks leader as the most-recent toucher of the file. Not
+    // critical for this test — we only care about regression ranking.
+    getBlameMock.mockResolvedValueOnce(
+      singleRangeBlame({
+        sha: "leader-sha",
+        message: "refactor: checkout flow",
+        authorLogin: "alice",
+      })
+    );
+    const now = Date.now();
+    listCommitsMock.mockResolvedValueOnce([
+      {
+        sha: "leader-sha",
+        message: "refactor: checkout flow",
+        authorLogin: "alice",
+        authorName: "Alice",
+        authorEmail: null,
+        date: new Date(now - 1 * 86_400_000).toISOString(),
+        htmlUrl: "https://github.com/acme/checkout/commit/leader-sha",
+      },
+      {
+        sha: "truth-sha",
+        message: "fix: checkout submit flow",
+        authorLogin: "bob",
+        authorName: "Bob",
+        authorEmail: null,
+        date: new Date(now - 3 * 86_400_000).toISOString(),
+        htmlUrl: "https://github.com/acme/checkout/commit/truth-sha",
+      },
+    ]);
+
+    // Diff-aware mocks: only `truth-sha` has a hunk covering line 42.
+    getCommitDiffMock.mockImplementation(async (_tok, _o, _r, sha) => {
+      if (sha === "truth-sha") {
+        return {
+          sha,
+          truncated: false,
+          files: [
+            {
+              path: "src/lib/checkout.ts",
+              previousPath: null,
+              status: "modified" as const,
+              additions: 2,
+              deletions: 1,
+              hunks: [{ oldStart: 40, oldLines: 3, newStart: 40, newLines: 5 }],
+            },
+          ],
+        };
+      }
+      return {
+        sha,
+        truncated: false,
+        files: [
+          {
+            path: "src/lib/checkout.ts",
+            previousPath: null,
+            status: "modified" as const,
+            additions: 1,
+            deletions: 0,
+            // Leader touches the file but at a different range.
+            hunks: [{ oldStart: 100, oldLines: 1, newStart: 100, newLines: 2 }],
+          },
+        ],
+      };
+    });
+
+    const input = sampleInput();
+    input.evidence = [
+      evidenceVM({
+        extracted: {
+          stackFrames: ["at foo (src/lib/checkout.ts:42:3)"],
+        },
+      }),
+    ];
+    input.diagnosis = diagnosisVM({
+      affectedArea: "checkout flow",
+      probableRootCause: "submit boundary regression",
+    });
+
+    const result = await loadRepoEnrichmentForCase({
+      userId: "u1",
+      caseId: "case-1",
+      input,
+    });
+
+    expect(result?.likelyCulprit).toBeDefined();
+    expect(result?.likelyCulprit?.sha).toBe("truth-sha");
+    expect(
+      result?.likelyCulprit?.reasons.some((r) =>
+        r.includes("diff touches src/lib/checkout.ts:42")
+      )
+    ).toBe(true);
+  });
+
+  it("skips diff fetch entirely when no resolved stack lines are available", async () => {
+    // Evidence carries no stack frames → resolver yields no line-typed
+    // stack locations → second pass short-circuits → getCommitDiff
+    // must never be called.
+    caseFindUnique.mockResolvedValueOnce({
+      workspaceId: "ws-1",
+      repoLinkId: "rlink-1",
+    });
+    repoLinkFindUnique.mockResolvedValueOnce(mockRepoLink());
+    repoFileFindMany.mockResolvedValueOnce([mockFile("src/lib/checkout.ts")]);
+    repoSymbolFindMany.mockResolvedValueOnce([]);
+    githubAccountFindUnique.mockResolvedValue({
+      accessTokenEnc: "encrypted-blob",
+    });
+    getBlameMock.mockResolvedValueOnce(
+      singleRangeBlame({
+        sha: "only-sha",
+        message: "fix: checkout",
+        authorLogin: "alice",
+      })
+    );
+    listCommitsMock.mockResolvedValueOnce([
+      {
+        sha: "only-sha",
+        message: "fix: checkout",
+        authorLogin: "alice",
+        authorName: "Alice",
+        authorEmail: null,
+        date: new Date(Date.now() - 86_400_000).toISOString(),
+        htmlUrl: "https://github.com/acme/checkout/commit/only-sha",
+      },
+    ]);
+
+    const input = sampleInput();
+    // Affected area has a path hint so the enrichment resolver still
+    // produces a file resolution, but no stack frames → no line info.
+    input.evidence = [evidenceVM({ extracted: { stackFrames: [] } })];
+    input.diagnosis = diagnosisVM({
+      affectedArea: "src/lib/checkout.ts",
+      probableRootCause: "checkout bug",
+    });
+
+    await loadRepoEnrichmentForCase({
+      userId: "u1",
+      caseId: "case-1",
+      input,
+    });
+
+    expect(getCommitDiffMock).not.toHaveBeenCalled();
+  });
+
+  it("falls back to first-pass pick when every diff fetch fails", async () => {
+    caseFindUnique.mockResolvedValueOnce({
+      workspaceId: "ws-1",
+      repoLinkId: "rlink-1",
+    });
+    repoLinkFindUnique.mockResolvedValueOnce(mockRepoLink());
+    repoFileFindMany.mockResolvedValueOnce([mockFile("src/lib/checkout.ts")]);
+    repoSymbolFindMany.mockResolvedValueOnce([]);
+    githubAccountFindUnique.mockResolvedValue({
+      accessTokenEnc: "encrypted-blob",
+    });
+    getBlameMock.mockResolvedValueOnce(
+      singleRangeBlame({
+        sha: "pick-sha",
+        message: "fix: checkout flow",
+        authorLogin: "alice",
+      })
+    );
+    listCommitsMock.mockResolvedValueOnce([
+      {
+        sha: "pick-sha",
+        message: "fix: checkout flow regression",
+        authorLogin: "alice",
+        authorName: "Alice",
+        authorEmail: null,
+        date: new Date(Date.now() - 86_400_000).toISOString(),
+        htmlUrl: "https://github.com/acme/checkout/commit/pick-sha",
+      },
+    ]);
+    // Every diff fetch blows up — simulates GitHub outage or revoked
+    // token mid-flight. The packet must still ship with the first
+    // pass's culprit pick.
+    getCommitDiffMock.mockRejectedValue(new Error("diff endpoint 502"));
+
+    const input = sampleInput();
+    input.evidence = [
+      evidenceVM({
+        extracted: {
+          stackFrames: ["at foo (src/lib/checkout.ts:42:3)"],
+        },
+      }),
+    ];
+    input.diagnosis = diagnosisVM({
+      affectedArea: "checkout flow",
+      probableRootCause: "regression in checkout",
+    });
+
+    const result = await loadRepoEnrichmentForCase({
+      userId: "u1",
+      caseId: "case-1",
+      input,
+    });
+
+    // First-pass pick survives — no crash, no missing culprit.
+    expect(result?.likelyCulprit?.sha).toBe("pick-sha");
+    // No diff-touches reason because every fetch failed.
+    expect(
+      result?.likelyCulprit?.reasons.every((r) => !r.includes("diff touches"))
+    ).toBe(true);
+  });
+
+  it("falls back to first-pass pick when the user has no connected GitHub account", async () => {
+    // No account → no token → diff fetch short-circuits. This is the
+    // same path as "diffs fail" but earlier. Verify it doesn't crash
+    // AND doesn't even try to call the diff endpoint.
+    caseFindUnique.mockResolvedValueOnce({
+      workspaceId: "ws-1",
+      repoLinkId: "rlink-1",
+    });
+    repoLinkFindUnique.mockResolvedValueOnce(mockRepoLink());
+    repoFileFindMany.mockResolvedValueOnce([mockFile("src/lib/checkout.ts")]);
+    repoSymbolFindMany.mockResolvedValueOnce([]);
+    // Blame enrichment runs once with a token for the regression list,
+    // then the diff fetch tries again but the mock returns no account.
+    githubAccountFindUnique
+      .mockResolvedValueOnce({ accessTokenEnc: "encrypted-blob" }) // blame
+      .mockResolvedValue(null); // diff probe
+    getBlameMock.mockResolvedValueOnce(
+      singleRangeBlame({
+        sha: "pick-sha",
+        message: "fix: checkout flow regression",
+        authorLogin: "alice",
+      })
+    );
+    listCommitsMock.mockResolvedValueOnce([
+      {
+        sha: "pick-sha",
+        message: "fix: checkout flow regression",
+        authorLogin: "alice",
+        authorName: "Alice",
+        authorEmail: null,
+        date: new Date(Date.now() - 86_400_000).toISOString(),
+        htmlUrl: "https://github.com/acme/checkout/commit/pick-sha",
+      },
+    ]);
+
+    const input = sampleInput();
+    input.evidence = [
+      evidenceVM({
+        extracted: {
+          stackFrames: ["at foo (src/lib/checkout.ts:42:3)"],
+        },
+      }),
+    ];
+    input.diagnosis = diagnosisVM({
+      affectedArea: "checkout flow",
+      probableRootCause: "regression in checkout",
+    });
+
+    const result = await loadRepoEnrichmentForCase({
+      userId: "u1",
+      caseId: "case-1",
+      input,
+    });
+
+    expect(result?.likelyCulprit?.sha).toBe("pick-sha");
+    expect(getCommitDiffMock).not.toHaveBeenCalled();
   });
 
   it("falls back to file-level blame when the line is outside all ranges", async () => {

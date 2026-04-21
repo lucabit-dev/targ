@@ -144,6 +144,20 @@ const P_CONTRADICTS_SCOPE = 2;
 const NEGATIVE_SIGNAL_CONFIDENCE_CAP: LikelyCulprit["confidence"] = "medium";
 
 // ---------------------------------------------------------------------------
+// Phase 2.9 — diff-aware tunables
+// ---------------------------------------------------------------------------
+
+/// Bonus credit when a commit's diff actually touches one of the
+/// (file, line) pairs from the evidence stack frames. Precision here
+/// is much higher than file-hit ratio — "this commit changed line 42
+/// which appears in the crash trace" is a qualitatively stronger
+/// signal than "this commit touched checkout.ts somewhere". Weight
+/// picked so a single line hit pushes a borderline commit (score ~3)
+/// past MIN_SCORE_HIGH, but a lone line hit with no keyword overlap
+/// still needs other signals to reach the threshold.
+const W_DIFF_LINE_HIT = 2;
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -168,9 +182,28 @@ export type CulpritSignals = {
   /// demote commits whose scope disagrees with the evidence. Empty array
   /// or `undefined` → no contradiction penalties applied.
   contradictions?: string[];
+  /// Phase 2.9. (file, line) pairs extracted from the evidence stack
+  /// frames / resolved `RepoLocation`s. Paired with `diffProbesBySha`
+  /// below to power the diff-aware bonus: a commit whose diff actually
+  /// touches a stack-frame line scores higher than one that merely
+  /// touched the file.
+  stackLines?: Array<{ file: string; line: number }>;
+  /// Phase 2.9. Per-commit probe that tests whether the commit's diff
+  /// touches a given (file, line) pair on the POST-change side. The
+  /// caller is responsible for fetching the diff (expensive — usually
+  /// only for top-K candidates) and wrapping it in a probe function;
+  /// the scorer stays pure and has no upstream dependency.
+  /// Missing entries → no diff signal for that commit.
+  diffProbesBySha?: Map<string, CommitDiffProbe>;
   /// Clock override for the recency signal. Defaults to `new Date()`.
   now?: Date;
 };
+
+/// Adapter-owned probe shape. Keeps the scorer decoupled from the
+/// github-client types — service-layer callers wrap their fetched
+/// `GithubCommitDiff` in a closure that captures it and invokes
+/// `diffTouchesLine` internally.
+export type CommitDiffProbe = (file: string, line: number) => boolean;
 
 export type CulpritDetectionResult = {
   /// `null` when no candidate cleared the medium threshold. Distinct from
@@ -183,6 +216,12 @@ export type CulpritDetectionResult = {
   /// SHA of the runner-up, for observability/logging. `null` when there
   /// are < 2 candidates.
   runnerUpSha: string | null;
+  /// Phase 2.9. SHAs of the top candidates ordered by post-penalty
+  /// score (desc) then the same tiebreakers the picker uses. The
+  /// service layer reads this after the cheap first pass to decide
+  /// which commits are worth fetching diffs for — typically the first
+  /// 2-3. Always includes the picked culprit first (when non-null).
+  topCandidateShas: string[];
 };
 
 /// Picks the most-likely culprit from the regressions list, scored against
@@ -196,7 +235,12 @@ export function detectLikelyCulprit(
   signals: CulpritSignals
 ): CulpritDetectionResult {
   if (regressions.length === 0) {
-    return { culprit: null, topScore: 0, runnerUpSha: null };
+    return {
+      culprit: null,
+      topScore: 0,
+      runnerUpSha: null,
+      topCandidateShas: [],
+    };
   }
 
   const areaTokens = tokenize(signals.affectedArea);
@@ -205,6 +249,10 @@ export function detectLikelyCulprit(
   const resolvedFiles = signals.resolvedFiles ?? [];
   const now = signals.now ?? new Date();
   const excludedScopes = extractContradictionScopes(signals.contradictions);
+  const stackLines = (signals.stackLines ?? []).filter(
+    (s) => Number.isFinite(s.line) && s.line > 0
+  );
+  const diffProbesBySha = signals.diffProbesBySha;
   // The diagnosis tokens tell us which kinds of files are legitimately
   // in-scope. If the affected area IS about tests, then test-only commits
   // shouldn't be demoted. Same for docs / config / platform scopes.
@@ -224,6 +272,8 @@ export function detectLikelyCulprit(
       resolvedFiles,
       excludedScopes,
       diagnosisScopes,
+      stackLines,
+      diffProbesBySha,
       now,
     })
   );
@@ -241,6 +291,10 @@ export function detectLikelyCulprit(
   const top = scored[0];
   const runnerUp = scored[1];
   const gap = runnerUp ? top.score - runnerUp.score : Infinity;
+  // `topCandidateShas` is exposed on every return path so service
+  // callers can decide which commits are worth an expensive diff
+  // fetch. Cap at 5 to keep the log line + call fan-out reasonable.
+  const topCandidateShas = scored.slice(0, 5).map((s) => s.commit.sha);
 
   // Threshold check uses `rawScore` (positives only) so a commit with
   // strong positive signal still surfaces when heavily penalised — but
@@ -251,6 +305,7 @@ export function detectLikelyCulprit(
       culprit: null,
       topScore: top.score,
       runnerUpSha: runnerUp?.commit.sha ?? null,
+      topCandidateShas,
     };
   }
 
@@ -275,6 +330,7 @@ export function detectLikelyCulprit(
     },
     topScore: top.score,
     runnerUpSha: runnerUp?.commit.sha ?? null,
+    topCandidateShas,
   };
 }
 
@@ -289,7 +345,12 @@ export function detectLikelyCulpritFromEnrichment(
     !enrichment.suspectedRegressions ||
     enrichment.suspectedRegressions.length === 0
   ) {
-    return { culprit: null, topScore: 0, runnerUpSha: null };
+    return {
+      culprit: null,
+      topScore: 0,
+      runnerUpSha: null,
+      topCandidateShas: [],
+    };
   }
   const resolvedFiles = collectResolvedFiles(enrichment);
   return detectLikelyCulprit(enrichment.suspectedRegressions, {
@@ -318,6 +379,16 @@ type ScoreContext = {
   /// we suppress the kind-only penalty — it's not a false positive, it's
   /// the right kind of commit to suspect.
   diagnosisScopes: Set<Scope>;
+  /// Phase 2.9. Normalised (file, line) pairs from the evidence stack
+  /// frames. Only entries with a finite, positive `line` survive the
+  /// filter in `detectLikelyCulprit` — the scorer doesn't need to
+  /// re-validate.
+  stackLines: Array<{ file: string; line: number }>;
+  /// Phase 2.9. Per-commit diff probe map. Undefined when the service
+  /// didn't fetch any diffs (cheapest path); empty map behaves the
+  /// same. Individual misses (commit with no entry) just skip the
+  /// bonus for that commit.
+  diffProbesBySha: Map<string, CommitDiffProbe> | undefined;
   now: Date;
 };
 
@@ -439,6 +510,25 @@ function scoreCommit(commit: CommitRef, ctx: ScoreContext): ScoredCommit {
     if (ageDays >= 0 && ageDays <= RECENT_MERGE_WINDOW_DAYS) {
       credit(W_RECENT_MERGE);
       reasons.push(formatRelativeAge(ageDays));
+    }
+  }
+
+  // Phase 2.9 — diff-aware precision bonus. When the service has
+  // fetched this commit's diff (expensive; typically only for top-K
+  // candidates), check whether any of its hunks covers a line from
+  // the evidence stack frames. A hit means the commit *actually
+  // changed* a line in the crash trace — a qualitatively stronger
+  // signal than "touched the same file somewhere". We credit a single
+  // flat bonus regardless of how many lines hit, then push one reason
+  // bullet naming the first hit for the chip.
+  const probe = ctx.diffProbesBySha?.get(commit.sha);
+  if (probe && ctx.stackLines.length > 0) {
+    const firstHit = ctx.stackLines.find((s) => probe(s.file, s.line));
+    if (firstHit) {
+      credit(W_DIFF_LINE_HIT);
+      reasons.push(
+        `diff touches ${firstHit.file}:${firstHit.line} (stack frame)`
+      );
     }
   }
 

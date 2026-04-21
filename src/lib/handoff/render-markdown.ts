@@ -132,10 +132,18 @@ function formatLikelyCulpritChip(packet: HandoffPacket): string {
   // are the most important signal in the chip — they're the reason
   // the culprit was demoted to "Possible". Surface them first so the
   // .slice(0, 3) truncation can't drop them when there are 3+
-  // positive reasons. Order within each group is preserved.
+  // reasons. Order within each group is preserved. Priority order:
+  //   1. Negative reasons ("but ...") — must never be hidden, they
+  //      explain why confidence is capped.
+  //   2. Diff-aware line hits (Phase 2.9) — highest-precision positive
+  //      signal, most useful for the receiving agent.
+  //   3. Everything else (keyword / file / recency matches).
+  const isNegative = (r: string) => r.startsWith("but ");
+  const isDiffHit = (r: string) => r.startsWith("diff touches ");
   const orderedReasons = [
-    ...culprit.reasons.filter((r) => r.startsWith("but ")),
-    ...culprit.reasons.filter((r) => !r.startsWith("but ")),
+    ...culprit.reasons.filter(isNegative),
+    ...culprit.reasons.filter((r) => !isNegative(r) && isDiffHit(r)),
+    ...culprit.reasons.filter((r) => !isNegative(r) && !isDiffHit(r)),
   ];
   const reasons = orderedReasons.slice(0, 3).join(" \u00b7 ");
 

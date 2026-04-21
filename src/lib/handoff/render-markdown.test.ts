@@ -823,6 +823,85 @@ describe("phase 2.8 — negative-evidence rendering", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Phase 2.9 — diff-aware rendering
+// ---------------------------------------------------------------------------
+
+describe("phase 2.9 — diff-aware rendering", () => {
+  function buildDiffPacket(reasons: string[]) {
+    const sha = "diffhitsha00000000000000000000000000cafe";
+    return buildHandoffPacket({
+      ...CONTRADICTION_FIXTURE_INPUT,
+      repoEnrichment: {
+        repoFullName: "acme/checkout",
+        ref: "deadbeef0000000000000000000000000000cafe",
+        suspectedRegressions: [
+          {
+            sha,
+            message: "fix: null guard in submit",
+            author: "alice",
+            date: new Date(Date.now() - 86_400_000).toISOString(),
+            prNumber: 842,
+            url: `https://github.com/acme/checkout/commit/${sha}`,
+            touchedFiles: ["src/checkout.ts"],
+          },
+        ],
+        likelyCulprit: { sha, confidence: "high", reasons },
+      },
+    });
+  }
+
+  it("renders the diff-touches reason when the commit's diff hit a stack line", () => {
+    const markdown = renderPacketMarkdown(
+      buildDiffPacket([
+        'matches affected area: "checkout submit"',
+        "diff touches src/checkout.ts:42 (stack frame)",
+        "merged 1 day ago",
+      ])
+    );
+    expect(markdown).toContain("diff touches src/checkout.ts:42");
+  });
+
+  it("prioritises the diff-touches reason over generic positives in the chip", () => {
+    // With 4 reasons + slice(0, 3): the diff hit outranks the plain
+    // keyword/file/recency matches, so it must survive truncation even
+    // when 3+ ordinary positives are also present.
+    const markdown = renderPacketMarkdown(
+      buildDiffPacket([
+        'matches affected area: "checkout"',
+        "touched 1 of 1 suspected file",
+        "merged 1 day ago",
+        "diff touches src/checkout.ts:42 (stack frame)",
+      ])
+    );
+    expect(markdown).toContain("diff touches src/checkout.ts:42");
+    // Prove it's in the rationale (italicised, parenthesised at end
+    // of the chip line). The chip is wrapped to ~100 chars so the
+    // rationale can span multiple physical lines — use a
+    // multiline/dotall-style match via [\s\S] so `.` equivalents
+    // cross newlines, and non-greedy to pin down the nearest `)_`.
+    const rationale =
+      markdown.match(/_\(([\s\S]+?)\)_/)?.[1].replace(/\s+/g, " ") ?? "";
+    expect(rationale).toContain("diff touches src/checkout.ts:42");
+  });
+
+  it("negative reasons still outrank diff-touches reasons", () => {
+    // Ordering contract: negatives > diff hits > everything else.
+    const markdown = renderPacketMarkdown(
+      buildDiffPacket([
+        "diff touches src/checkout.ts:42 (stack frame)",
+        "but all touched files are tests",
+        "matches affected area",
+      ])
+    );
+    const rationale =
+      markdown.match(/_\(([\s\S]+?)\)_/)?.[1].replace(/\s+/g, " ") ?? "";
+    const parts = rationale.split(" · ");
+    expect(parts[0].startsWith("but ")).toBe(true);
+    expect(parts[1].startsWith("diff touches")).toBe(true);
+  });
+});
+
 describe("phase 2.7 — invariants", () => {
   function packetWithCulprit(
     culpritOverrides: Record<string, unknown> = {}

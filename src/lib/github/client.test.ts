@@ -1,13 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  diffTouchesLine,
   exchangeCodeForToken,
   getAuthenticatedUser,
+  getCommitDiff,
   getFileBlameRanges,
   getRepo,
   GithubApiError,
   listCommitsForPath,
   listUserRepos,
+  parseUnifiedDiffHunks,
 } from "./client";
 
 const fetchMock = vi.fn();
@@ -511,6 +514,250 @@ describe("github client", () => {
       await expect(
         getFileBlameRanges("bad-tok", "o", "r", "ref", "x.ts")
       ).rejects.toBeInstanceOf(GithubApiError);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Phase 2.9 — commit diff + hunk parsing
+  // -------------------------------------------------------------------------
+
+  describe("parseUnifiedDiffHunks", () => {
+    it("extracts new-file ranges from a multi-hunk patch", () => {
+      const patch = [
+        "@@ -10,7 +10,8 @@ context",
+        " a",
+        "-b",
+        "+b-new",
+        "+c",
+        " d",
+        "@@ -100,3 +110,3 @@ context",
+        " x",
+        "-y",
+        "+y-new",
+      ].join("\n");
+      const hunks = parseUnifiedDiffHunks(patch);
+      expect(hunks).toEqual([
+        { oldStart: 10, oldLines: 7, newStart: 10, newLines: 8 },
+        { oldStart: 100, oldLines: 3, newStart: 110, newLines: 3 },
+      ]);
+    });
+
+    it("defaults line counts to 1 when omitted (single-line change)", () => {
+      // `@@ -5 +5 @@` is valid unified-diff syntax for a 1-line hunk.
+      const hunks = parseUnifiedDiffHunks("@@ -5 +5 @@\n-a\n+b");
+      expect(hunks).toEqual([
+        { oldStart: 5, oldLines: 1, newStart: 5, newLines: 1 },
+      ]);
+    });
+
+    it("returns empty array for undefined, empty, or malformed input", () => {
+      expect(parseUnifiedDiffHunks(undefined)).toEqual([]);
+      expect(parseUnifiedDiffHunks("")).toEqual([]);
+      // No `@@` header → binary file or text we can't parse.
+      expect(parseUnifiedDiffHunks("no hunks here")).toEqual([]);
+    });
+
+    it("skips hunks with non-finite numbers without throwing", () => {
+      // This shouldn't happen in practice but defends against corrupt
+      // patches leaking NaN ranges into the scorer.
+      const hunks = parseUnifiedDiffHunks("@@ -abc,7 +10,8 @@");
+      expect(hunks).toEqual([]);
+    });
+  });
+
+  describe("getCommitDiff", () => {
+    it("fetches the commit detail endpoint and parses per-file hunks", async () => {
+      fetchMock.mockResolvedValueOnce(
+        jsonResponse({
+          sha: "abc123",
+          files: [
+            {
+              filename: "src/checkout.ts",
+              status: "modified",
+              additions: 3,
+              deletions: 1,
+              patch: "@@ -40,5 +40,7 @@ ctx\n a\n-b\n+b2\n+c\n+d",
+            },
+            {
+              filename: "README.md",
+              status: "modified",
+              additions: 1,
+              deletions: 0,
+              patch: "@@ -1,2 +1,3 @@\n x\n+y",
+            },
+          ],
+        })
+      );
+
+      const diff = await getCommitDiff("token", "acme", "checkout", "abc123");
+
+      const call = fetchMock.mock.calls[0];
+      expect(call[0]).toContain("/repos/acme/checkout/commits/abc123");
+      expect(diff.sha).toBe("abc123");
+      expect(diff.truncated).toBe(false);
+      expect(diff.files).toHaveLength(2);
+      expect(diff.files[0]).toMatchObject({
+        path: "src/checkout.ts",
+        status: "modified",
+        additions: 3,
+        deletions: 1,
+      });
+      expect(diff.files[0].hunks).toEqual([
+        { oldStart: 40, oldLines: 5, newStart: 40, newLines: 7 },
+      ]);
+    });
+
+    it("flags truncated=true when a modified file has no patch", async () => {
+      // GitHub returns `patch: undefined` for files beyond the 1MB cap
+      // or for binary files. We want callers to know the signal is
+      // incomplete for this commit.
+      fetchMock.mockResolvedValueOnce(
+        jsonResponse({
+          sha: "big",
+          files: [
+            {
+              filename: "huge.txt",
+              status: "modified",
+              additions: 1000,
+              deletions: 1000,
+              // No patch — file exceeded the size limit.
+            },
+          ],
+        })
+      );
+
+      const diff = await getCommitDiff("t", "o", "r", "big");
+      expect(diff.truncated).toBe(true);
+      expect(diff.files[0].hunks).toEqual([]);
+    });
+
+    it("does NOT flag truncation for removed/renamed files without patches", async () => {
+      // Removed files legitimately lack a patch on the post-change
+      // side. This isn't truncation.
+      fetchMock.mockResolvedValueOnce(
+        jsonResponse({
+          sha: "rm",
+          files: [
+            {
+              filename: "gone.ts",
+              status: "removed",
+              additions: 0,
+              deletions: 5,
+            },
+            {
+              filename: "new.ts",
+              previous_filename: "old.ts",
+              status: "renamed",
+              additions: 0,
+              deletions: 0,
+            },
+          ],
+        })
+      );
+
+      const diff = await getCommitDiff("t", "o", "r", "rm");
+      expect(diff.truncated).toBe(false);
+      expect(diff.files[1].previousPath).toBe("old.ts");
+    });
+
+    it("handles missing files array (empty commit edge case)", async () => {
+      fetchMock.mockResolvedValueOnce(jsonResponse({ sha: "empty" }));
+      const diff = await getCommitDiff("t", "o", "r", "empty");
+      expect(diff.files).toEqual([]);
+      expect(diff.truncated).toBe(false);
+    });
+
+    it("normalises unknown status strings to 'changed'", async () => {
+      fetchMock.mockResolvedValueOnce(
+        jsonResponse({
+          sha: "weird",
+          files: [
+            {
+              filename: "a.ts",
+              status: "frobnicated",
+              patch: "@@ -1 +1 @@\n-x\n+y",
+            },
+          ],
+        })
+      );
+      const diff = await getCommitDiff("t", "o", "r", "weird");
+      expect(diff.files[0].status).toBe("changed");
+    });
+  });
+
+  describe("diffTouchesLine", () => {
+    const diff = {
+      sha: "x",
+      truncated: false,
+      files: [
+        {
+          path: "src/a.ts",
+          previousPath: null,
+          status: "modified" as const,
+          additions: 3,
+          deletions: 1,
+          hunks: [
+            { oldStart: 10, oldLines: 5, newStart: 10, newLines: 7 },
+            { oldStart: 40, oldLines: 2, newStart: 42, newLines: 2 },
+          ],
+        },
+        {
+          path: "src/renamed.ts",
+          previousPath: "src/old.ts",
+          status: "renamed" as const,
+          additions: 1,
+          deletions: 0,
+          hunks: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 2 }],
+        },
+      ],
+    };
+
+    it("returns true when the line falls inside any new-file hunk range", () => {
+      // First hunk covers lines [10, 17). Line 15 is inside.
+      expect(diffTouchesLine(diff, "src/a.ts", 15)).toBe(true);
+      // Exact start.
+      expect(diffTouchesLine(diff, "src/a.ts", 10)).toBe(true);
+      // Last line in the hunk: newStart + newLines - 1 = 16.
+      expect(diffTouchesLine(diff, "src/a.ts", 16)).toBe(true);
+    });
+
+    it("returns false for lines just outside every hunk", () => {
+      expect(diffTouchesLine(diff, "src/a.ts", 9)).toBe(false);
+      // Line 17 = newStart + newLines (exclusive upper bound).
+      expect(diffTouchesLine(diff, "src/a.ts", 17)).toBe(false);
+      // Between hunks.
+      expect(diffTouchesLine(diff, "src/a.ts", 30)).toBe(false);
+    });
+
+    it("matches renamed files on either new or previous path", () => {
+      expect(diffTouchesLine(diff, "src/renamed.ts", 1)).toBe(true);
+      expect(diffTouchesLine(diff, "src/old.ts", 1)).toBe(true);
+    });
+
+    it("returns false for unknown files, zero/negative lines, NaN", () => {
+      expect(diffTouchesLine(diff, "src/other.ts", 15)).toBe(false);
+      expect(diffTouchesLine(diff, "src/a.ts", 0)).toBe(false);
+      expect(diffTouchesLine(diff, "src/a.ts", -1)).toBe(false);
+      expect(diffTouchesLine(diff, "src/a.ts", Number.NaN)).toBe(false);
+    });
+
+    it("skips pure-deletion hunks (newLines === 0)", () => {
+      const delOnly = {
+        sha: "d",
+        truncated: false,
+        files: [
+          {
+            path: "src/a.ts",
+            previousPath: null,
+            status: "modified" as const,
+            additions: 0,
+            deletions: 3,
+            hunks: [{ oldStart: 10, oldLines: 3, newStart: 9, newLines: 0 }],
+          },
+        ],
+      };
+      // newStart 9 + newLines 0 → the hunk covers no post-change line.
+      expect(diffTouchesLine(delOnly, "src/a.ts", 9)).toBe(false);
     });
   });
 });
