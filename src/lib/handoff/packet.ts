@@ -76,6 +76,14 @@ export type HandoffPacket = {
     ref: string;
     stackLocations?: RepoLocation[];
     suspectedRegressions?: CommitRef[];
+    /// "Most-likely culprit" picked by Phase 2.7 from `suspectedRegressions`
+    /// by cross-referencing the LLM's `affectedArea` / `probableRootCause`
+    /// keywords against each regression's commit message + touched files.
+    /// Emitted only when the top-scoring candidate clears the medium
+    /// confidence threshold; otherwise omitted (no chip = no culprit
+    /// claim). Always references a `sha` that exists in
+    /// `suspectedRegressions` — invariant 11 enforces this.
+    likelyCulprit?: LikelyCulprit;
   };
 
   priors?: PriorCase[];
@@ -140,6 +148,29 @@ export type CommitRef = {
   prNumber?: number;
   url?: string;
   touchedFiles: string[];
+};
+
+/// Phase 2.7. Points at the most-likely-regression-causing commit among the
+/// `suspectedRegressions`. Carries both the pick (`sha`) and the reasoning
+/// (`reasons`) so receivers can audit the heuristic — this is a guess, not
+/// ground truth, and we want that visible.
+export type LikelyCulprit = {
+  /// SHA of the picked commit. MUST be present in
+  /// `repoContext.suspectedRegressions`. Receivers can resolve the full
+  /// commit metadata (author, message, PR #, files) by looking up the
+  /// matching entry in `suspectedRegressions`.
+  sha: string;
+  /// Confidence band. We don't emit `low` — below the medium threshold the
+  /// whole `likelyCulprit` field is omitted, since a low-confidence guess
+  /// is worse than no guess.
+  confidence: "high" | "medium";
+  /// Human-readable bullets explaining why this commit was picked. Each
+  /// bullet must be a non-empty string. The renderer joins them with " · "
+  /// to produce the chip rationale. Example:
+  ///   ["matches affected area: 'checkout flow'",
+  ///    "touched 2 of 3 suspected files",
+  ///    "merged 2 days ago"]
+  reasons: string[];
 };
 
 export type PriorCase = {
@@ -214,6 +245,12 @@ export type RepoEnrichmentInput = {
   /// resolved locations each commit touched, then by recency. Feeds
   /// `repoContext.suspectedRegressions`.
   suspectedRegressions?: CommitRef[];
+  /// Phase 2.7. The most-likely-culprit pick among `suspectedRegressions`.
+  /// Computed by scoring each regression against the LLM's affected-area
+  /// + probable-root-cause keywords. Feeds `repoContext.likelyCulprit`.
+  /// Populated only when a candidate clears the medium-confidence
+  /// threshold.
+  likelyCulprit?: LikelyCulprit;
 };
 
 // ---------------------------------------------------------------------------
@@ -715,6 +752,15 @@ export function buildHandoffPacket(input: HandoffPacketInput): HandoffPacket {
           enrichment.suspectedRegressions && enrichment.suspectedRegressions.length > 0
             ? enrichment.suspectedRegressions
             : input.repoContext?.suspectedRegressions;
+        // Phase 2.7: only carry `likelyCulprit` through when its `sha` is
+        // present in the regressions list we're actually shipping. A
+        // culprit pointing at a commit we dropped would fail invariant 11
+        // — better to silently omit than to corrupt the packet.
+        const culprit =
+          enrichment.likelyCulprit &&
+          regressions?.some((r) => r.sha === enrichment.likelyCulprit!.sha)
+            ? enrichment.likelyCulprit
+            : undefined;
         const ctx: HandoffPacket["repoContext"] = {
           repoFullName: enrichment.repoFullName,
           ref: enrichment.ref,
@@ -724,6 +770,7 @@ export function buildHandoffPacket(input: HandoffPacketInput): HandoffPacket {
           ...(regressions && regressions.length > 0
             ? { suspectedRegressions: regressions }
             : {}),
+          ...(culprit ? { likelyCulprit: culprit } : {}),
         };
         return { repoContext: ctx };
       }
@@ -984,6 +1031,47 @@ export function assertPacketValid(
         throw new HandoffPacketInvariantError(
           "suspected_regression_files_required",
           "repoContext.suspectedRegressions[*].touchedFiles must be a non-empty array."
+        );
+      }
+    }
+
+    // Invariant 11: likelyCulprit (Phase 2.7) must reference a real
+    // regression and carry a non-empty reasons array. We deliberately fail
+    // closed — half-formed culprits that don't map to a regression entry
+    // would render as orphan chips with no audit trail.
+    if (packet.repoContext.likelyCulprit) {
+      const culprit = packet.repoContext.likelyCulprit;
+      if (typeof culprit.sha !== "string" || culprit.sha.trim().length === 0) {
+        throw new HandoffPacketInvariantError(
+          "likely_culprit_sha_required",
+          "repoContext.likelyCulprit.sha must be a non-empty string."
+        );
+      }
+      if (culprit.confidence !== "high" && culprit.confidence !== "medium") {
+        throw new HandoffPacketInvariantError(
+          "likely_culprit_confidence_band",
+          `repoContext.likelyCulprit.confidence must be "high" or "medium"; got "${culprit.confidence}".`
+        );
+      }
+      if (!Array.isArray(culprit.reasons) || culprit.reasons.length === 0) {
+        throw new HandoffPacketInvariantError(
+          "likely_culprit_reasons_required",
+          "repoContext.likelyCulprit.reasons must be a non-empty array."
+        );
+      }
+      for (const reason of culprit.reasons) {
+        if (typeof reason !== "string" || reason.trim().length === 0) {
+          throw new HandoffPacketInvariantError(
+            "likely_culprit_reasons_required",
+            "Every entry in repoContext.likelyCulprit.reasons must be a non-empty string."
+          );
+        }
+      }
+      const regressions = packet.repoContext.suspectedRegressions ?? [];
+      if (!regressions.some((r) => r.sha === culprit.sha)) {
+        throw new HandoffPacketInvariantError(
+          "likely_culprit_must_match_regression",
+          `repoContext.likelyCulprit.sha "${culprit.sha}" does not match any suspectedRegressions[*].sha. The culprit must be one of the listed regressions so receivers can audit it.`
         );
       }
     }
