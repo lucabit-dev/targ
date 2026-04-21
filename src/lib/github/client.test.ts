@@ -5,6 +5,7 @@ import {
   getAuthenticatedUser,
   getRepo,
   GithubApiError,
+  listCommitsForPath,
   listUserRepos,
 } from "./client";
 
@@ -214,6 +215,115 @@ describe("github client", () => {
           clientSecret: "secret",
           redirectUri: "https://targ.example/callback",
         })
+      ).rejects.toBeInstanceOf(GithubApiError);
+    });
+  });
+
+  describe("listCommitsForPath", () => {
+    it("normalises the commit payload and prefers login as author", async () => {
+      fetchMock.mockResolvedValueOnce(
+        jsonResponse([
+          {
+            sha: "abc123",
+            html_url: "https://github.com/octo/repo/commit/abc123",
+            commit: {
+              message: "fix: null check in checkout\n\nCo-authored-by: ...",
+              author: {
+                name: "Alice",
+                email: "alice@example.com",
+                date: "2026-04-15T12:34:56Z",
+              },
+            },
+            author: { login: "alice" },
+          },
+        ])
+      );
+
+      const commits = await listCommitsForPath(
+        "tok",
+        "octo",
+        "repo",
+        "src/lib/checkout.ts"
+      );
+
+      expect(commits).toEqual([
+        {
+          sha: "abc123",
+          message: "fix: null check in checkout\n\nCo-authored-by: ...",
+          authorLogin: "alice",
+          authorName: "Alice",
+          authorEmail: "alice@example.com",
+          date: "2026-04-15T12:34:56Z",
+          htmlUrl: "https://github.com/octo/repo/commit/abc123",
+        },
+      ]);
+    });
+
+    it("falls back to commit.author.name when author.login is absent", async () => {
+      fetchMock.mockResolvedValueOnce(
+        jsonResponse([
+          {
+            sha: "def456",
+            html_url: "https://github.com/octo/repo/commit/def456",
+            commit: {
+              message: "refactor",
+              author: {
+                name: "Bob",
+                email: "bob@example.com",
+                date: "2026-04-01T00:00:00Z",
+              },
+            },
+            author: null,
+          },
+        ])
+      );
+
+      const [commit] = await listCommitsForPath(
+        "tok",
+        "octo",
+        "repo",
+        "src/lib/other.ts"
+      );
+      expect(commit.authorLogin).toBeNull();
+      expect(commit.authorName).toBe("Bob");
+    });
+
+    it("forwards path, ref, per_page, and since as query params", async () => {
+      fetchMock.mockResolvedValueOnce(jsonResponse([]));
+
+      await listCommitsForPath("tok", "octo", "repo", "src/app/page.tsx", {
+        ref: "abc123",
+        perPage: 10,
+        since: "2026-03-01T00:00:00Z",
+      });
+
+      const [calledUrl] = fetchMock.mock.calls[0];
+      const url = new URL(calledUrl);
+      expect(url.pathname).toBe("/repos/octo/repo/commits");
+      expect(url.searchParams.get("path")).toBe("src/app/page.tsx");
+      expect(url.searchParams.get("sha")).toBe("abc123");
+      expect(url.searchParams.get("per_page")).toBe("10");
+      expect(url.searchParams.get("since")).toBe("2026-03-01T00:00:00Z");
+    });
+
+    it("clamps perPage into [1, 100]", async () => {
+      fetchMock.mockResolvedValueOnce(jsonResponse([]));
+      await listCommitsForPath("tok", "octo", "repo", "x.ts", { perPage: 9999 });
+      const [calledUrl] = fetchMock.mock.calls[0];
+      expect(new URL(calledUrl).searchParams.get("per_page")).toBe("100");
+
+      fetchMock.mockResolvedValueOnce(jsonResponse([]));
+      await listCommitsForPath("tok", "octo", "repo", "x.ts", { perPage: 0 });
+      const [calledUrl2] = fetchMock.mock.calls[1];
+      expect(new URL(calledUrl2).searchParams.get("per_page")).toBe("1");
+    });
+
+    it("throws GithubApiError on non-2xx", async () => {
+      fetchMock.mockResolvedValueOnce(
+        jsonResponse({ message: "Not Found" }, 404)
+      );
+      await expect(
+        listCommitsForPath("tok", "octo", "missing", "x.ts")
       ).rejects.toBeInstanceOf(GithubApiError);
     });
   });

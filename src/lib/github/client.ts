@@ -297,6 +297,95 @@ export async function getTreeRecursive(
   };
 }
 
+/// Commit summary returned by GitHub's list-commits endpoint. We only keep
+/// the fields relevant to handoff-packet blame enrichment (Phase 2.5). The
+/// raw API includes much more (parents, tree, verification, stats) that we
+/// deliberately discard so callers can't accidentally leak heavy payloads
+/// into the packet.
+export type GithubCommitSummary = {
+  sha: string;
+  message: string;
+  /// Prefer the GitHub login when present (so we can `@mention`); fall back
+  /// to the commit author name (the raw git identity).
+  authorLogin: string | null;
+  authorName: string;
+  authorEmail: string | null;
+  /// ISO-8601 UTC date string (the *author* date — when the work was made,
+  /// not when it landed on the default branch).
+  date: string;
+  htmlUrl: string;
+};
+
+type GithubCommitApi = {
+  sha: string;
+  html_url: string;
+  commit: {
+    message: string;
+    author: {
+      name?: string | null;
+      email?: string | null;
+      date?: string | null;
+    } | null;
+  };
+  author: {
+    login?: string | null;
+  } | null;
+};
+
+function normalizeCommit(raw: GithubCommitApi): GithubCommitSummary {
+  const authorLogin = raw.author?.login ?? null;
+  const authorName = raw.commit.author?.name ?? authorLogin ?? "unknown";
+  const date =
+    raw.commit.author?.date ?? new Date(0).toISOString();
+  return {
+    sha: raw.sha,
+    message: raw.commit.message,
+    authorLogin,
+    authorName,
+    authorEmail: raw.commit.author?.email ?? null,
+    date,
+    htmlUrl: raw.html_url,
+  };
+}
+
+export type ListCommitsForPathOptions = {
+  /// Branch or commit SHA to read from. Defaults to the repo's default
+  /// branch if omitted.
+  ref?: string;
+  /// Hard cap on the returned slice. GitHub's per_page max is 100. Keep
+  /// this small for blame enrichment — we only need the most recent few.
+  perPage?: number;
+  /// Earliest author date to include (ISO 8601). Used to scope "suspected
+  /// regressions" to the last N days without pulling the whole history.
+  since?: string;
+};
+
+/// Lists the most recent commits that touched `path`, newest first. This is
+/// the canonical GitHub equivalent of `git log -- <path>`. We use it at
+/// packet-build time to enrich `RepoLocation.blame` (last commit touching
+/// the file) and `repoContext.suspectedRegressions` (commits touching
+/// resolved files in the last N days).
+export async function listCommitsForPath(
+  token: string,
+  owner: string,
+  name: string,
+  path: string,
+  options: ListCommitsForPathOptions = {}
+): Promise<GithubCommitSummary[]> {
+  const params = new URLSearchParams();
+  params.set("path", path);
+  params.set("per_page", String(Math.min(Math.max(options.perPage ?? 5, 1), 100)));
+  if (options.ref) params.set("sha", options.ref);
+  if (options.since) params.set("since", options.since);
+
+  const response = await githubFetch(
+    `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/commits?${params.toString()}`,
+    { token }
+  );
+  const raw = (await response.json()) as GithubCommitApi[];
+  return raw.map(normalizeCommit);
+}
+
 export type GithubOAuthTokenResponse = {
   accessToken: string;
   refreshToken: string | null;

@@ -208,6 +208,12 @@ export type RepoEnrichmentInput = {
   /// Distinct from per-evidence locations: these are "the code worth reading
   /// first", typically derived from parsed stack frames.
   stackLocations?: RepoLocation[];
+  /// Recent commits that touched the resolved files (Phase 2.5). Populated
+  /// by the blame-enrichment layer, which queries GitHub's list-commits
+  /// endpoint per unique file and aggregates results. Ranked by how many
+  /// resolved locations each commit touched, then by recency. Feeds
+  /// `repoContext.suspectedRegressions`.
+  suspectedRegressions?: CommitRef[];
 };
 
 // ---------------------------------------------------------------------------
@@ -701,14 +707,22 @@ export function buildHandoffPacket(input: HandoffPacketInput): HandoffPacket {
 
     ...(() => {
       if (enrichment) {
+        // Prefer enrichment-provided regressions (Phase 2.5) — they're the
+        // automated signal. Fall back to manually-supplied ones when the
+        // enrichment layer didn't populate any (e.g. blame API failed or
+        // the repo isn't connected).
+        const regressions =
+          enrichment.suspectedRegressions && enrichment.suspectedRegressions.length > 0
+            ? enrichment.suspectedRegressions
+            : input.repoContext?.suspectedRegressions;
         const ctx: HandoffPacket["repoContext"] = {
           repoFullName: enrichment.repoFullName,
           ref: enrichment.ref,
           ...(enrichment.stackLocations && enrichment.stackLocations.length > 0
             ? { stackLocations: enrichment.stackLocations }
             : {}),
-          ...(input.repoContext?.suspectedRegressions
-            ? { suspectedRegressions: input.repoContext.suspectedRegressions }
+          ...(regressions && regressions.length > 0
+            ? { suspectedRegressions: regressions }
             : {}),
         };
         return { repoContext: ctx };
@@ -883,6 +897,44 @@ export function assertPacketValid(
         `RepoLocation.line must be a positive integer; got ${JSON.stringify(location.line)}.`
       );
     }
+    // Invariant 8b: blame metadata (Phase 2.5). Fail fast on malformed blame
+    // so we don't emit half-rendered "last changed by undefined" strings.
+    if (location.blame) {
+      const { author, commitSha, commitMessage, date, prNumber } = location.blame;
+      if (typeof author !== "string" || author.trim().length === 0) {
+        throw new HandoffPacketInvariantError(
+          "repo_location_blame_author_required",
+          "RepoLocation.blame.author must be a non-empty string."
+        );
+      }
+      if (typeof commitSha !== "string" || commitSha.trim().length === 0) {
+        throw new HandoffPacketInvariantError(
+          "repo_location_blame_sha_required",
+          "RepoLocation.blame.commitSha must be a non-empty string."
+        );
+      }
+      if (typeof commitMessage !== "string") {
+        throw new HandoffPacketInvariantError(
+          "repo_location_blame_message_required",
+          "RepoLocation.blame.commitMessage must be a string."
+        );
+      }
+      if (typeof date !== "string" || date.trim().length === 0) {
+        throw new HandoffPacketInvariantError(
+          "repo_location_blame_date_required",
+          "RepoLocation.blame.date must be a non-empty string."
+        );
+      }
+      if (
+        prNumber !== undefined &&
+        (!Number.isInteger(prNumber) || prNumber <= 0)
+      ) {
+        throw new HandoffPacketInvariantError(
+          "repo_location_blame_pr_positive",
+          `RepoLocation.blame.prNumber must be a positive integer; got ${JSON.stringify(prNumber)}.`
+        );
+      }
+    }
   }
 
   // Invariant 9: if repoContext exists with a ref, it must be a plausible git
@@ -904,6 +956,36 @@ export function assertPacketValid(
         "repo_context_name_required",
         `repoContext.repoFullName must look like "owner/repo"; got "${packet.repoContext.repoFullName}".`
       );
+    }
+
+    // Invariant 10: each suspected regression CommitRef (Phase 2.5) must
+    // have the core fields populated. These ship to LLM agents, so partial
+    // rows would corrupt the "regression evidence" signal.
+    for (const commit of packet.repoContext.suspectedRegressions ?? []) {
+      if (typeof commit.sha !== "string" || commit.sha.trim().length === 0) {
+        throw new HandoffPacketInvariantError(
+          "suspected_regression_sha_required",
+          "repoContext.suspectedRegressions[*].sha must be non-empty."
+        );
+      }
+      if (typeof commit.author !== "string" || commit.author.trim().length === 0) {
+        throw new HandoffPacketInvariantError(
+          "suspected_regression_author_required",
+          "repoContext.suspectedRegressions[*].author must be non-empty."
+        );
+      }
+      if (typeof commit.date !== "string" || commit.date.trim().length === 0) {
+        throw new HandoffPacketInvariantError(
+          "suspected_regression_date_required",
+          "repoContext.suspectedRegressions[*].date must be non-empty."
+        );
+      }
+      if (!Array.isArray(commit.touchedFiles) || commit.touchedFiles.length === 0) {
+        throw new HandoffPacketInvariantError(
+          "suspected_regression_files_required",
+          "repoContext.suspectedRegressions[*].touchedFiles must be a non-empty array."
+        );
+      }
     }
   }
 }
