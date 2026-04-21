@@ -33,7 +33,11 @@ import {
   detectLikelyCulpritFromEnrichment,
   type CommitDiffProbe,
 } from "@/lib/handoff/culprit-detection";
-import type { HandoffPacketInput, RepoEnrichmentInput } from "@/lib/handoff/packet";
+import type {
+  HandoffPacketInput,
+  RepoEnrichmentInput,
+  RepoLocation,
+} from "@/lib/handoff/packet";
 import {
   enrichPacketInput,
   type EnrichmentContext,
@@ -198,12 +202,19 @@ export async function loadRepoEnrichmentForCase(
   // and rerun detection with a diff-aware bonus for commits whose diff
   // actually modifies a stack-frame line. Any failure in the diff pass
   // falls back to the first-pass result.
-  return applyCulpritDetection({
+  const withCulprit = await applyCulpritDetection({
     enrichment: blameEnriched,
     input: params.input,
     userId: params.userId,
     repoLink,
   });
+
+  // Phase 2.10.1: summarise stack-frame blame staleness. Runs AFTER
+  // culprit detection because "matched vs unmatched" is computed
+  // relative to the final `suspectedRegressions` list that's
+  // actually shipping in the packet. Pure, no I/O — everything's
+  // already on the enrichment.
+  return applyBlameStaleness(withCulprit);
 }
 
 /// Scoring layer (Phase 2.7 + 2.9) that picks the most-likely-culprit
@@ -317,6 +328,130 @@ async function applyCulpritDetection(params: {
   }
 
   return finaliseCulprit(enrichment, secondPass.culprit);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2.10.1 — blame staleness summary
+// ---------------------------------------------------------------------------
+
+/// How old a blame has to be before we treat it as "stale" for
+/// staleness-hint purposes. Matches the Phase 2.5 regression window:
+/// commits older than this aren't even considered "suspected
+/// regressions", so their blame attribution is a strong counter-
+/// signal to "this is a recent regression".
+const BLAME_STALENESS_DAYS = 30;
+
+/// Annotates the enrichment with a `blameStaleness` summary when at
+/// least one stack-frame (or evidence-location) blame record is both
+/// (a) older than `BLAME_STALENESS_DAYS` and (b) points at a commit
+/// NOT in `suspectedRegressions`. That combination means the line's
+/// most-recent change was long enough ago that the regression ranker
+/// didn't even consider it — the strongest signal we have that the
+/// bug is environmental rather than a recent-commit regression.
+///
+/// Stale blame that DOES match a suspected regression is NOT counted
+/// — it's handled by the Phase 2.10 blame-match chip on the culprit
+/// and isn't evidence against recency.
+///
+/// No-op when no stale-and-unmatched blame is found (the enrichment
+/// passes through unchanged). The renderer keys off the presence of
+/// the field, so omitting it cleanly suppresses the hint.
+export function applyBlameStaleness(
+  enrichment: RepoEnrichmentInput,
+  options: { now?: Date } = {}
+): RepoEnrichmentInput {
+  const now = options.now ?? new Date();
+  const regressionShas = new Set(
+    (enrichment.suspectedRegressions ?? []).map((r) => r.sha)
+  );
+
+  // Deduplicate by (file, line, sha) — the same stack frame may
+  // appear in both `stackLocations` and per-evidence `evidenceLocations`
+  // and we don't want a duplicated frame to inflate counts.
+  const seen = new Set<string>();
+  type StaleEntry = {
+    file: string;
+    line: number;
+    commitSha: string;
+    ageDays: number;
+    authorLogin: string | null;
+  };
+  const observations: { stale: StaleEntry[]; total: number } = {
+    stale: [],
+    total: 0,
+  };
+
+  const ingest = (loc: RepoLocation) => {
+    const line = loc.line;
+    const blame = loc.blame;
+    if (!blame || !blame.commitSha) return;
+    if (!line || !Number.isFinite(line) || line <= 0) return;
+    const key = `${loc.file}:${line}:${blame.commitSha}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    observations.total += 1;
+
+    // Matched-to-regression blame is NOT staleness evidence — even
+    // if the commit is old, the regression ranker already flagged
+    // it and the Phase 2.10 blame chip will render it. Including
+    // matched stale blame here would misleadingly say "this isn't
+    // a regression" while simultaneously surfacing the culprit.
+    if (regressionShas.has(blame.commitSha)) return;
+
+    const ts = Date.parse(blame.date);
+    // Unparseable dates are treated as maximally stale. This is the
+    // conservative call: if we can't date the blame, we can't
+    // confidently say "it's fresh", and surfacing a hint with
+    // "unknown date" is more informative than hiding the
+    // attribution entirely.
+    const ageDays = Number.isFinite(ts)
+      ? Math.max(0, (now.getTime() - ts) / 86_400_000)
+      : Infinity;
+    if (ageDays < BLAME_STALENESS_DAYS) return;
+
+    observations.stale.push({
+      file: loc.file,
+      line,
+      commitSha: blame.commitSha,
+      ageDays,
+      // `RepoLocation.blame` uses `author` (display login / name);
+      // we normalise to `authorLogin: string | null` to match the
+      // packet schema. Empty strings become `null` so the renderer
+      // can distinguish "no author" from a zero-length one.
+      authorLogin:
+        typeof blame.author === "string" && blame.author.length > 0
+          ? blame.author
+          : null,
+    });
+  };
+
+  for (const loc of enrichment.stackLocations ?? []) ingest(loc);
+  for (const list of Object.values(enrichment.evidenceLocations ?? {})) {
+    for (const loc of list) ingest(loc);
+  }
+
+  if (observations.stale.length === 0) return enrichment;
+
+  // Pick the oldest stale entry for display — "this line hasn't
+  // changed in N years" is the most emphatic wording and avoids a
+  // paradoxical situation where we cite a fresher stale commit
+  // when an older one exists.
+  let oldest = observations.stale[0];
+  for (const entry of observations.stale) {
+    if (entry.ageDays > oldest.ageDays) oldest = entry;
+  }
+
+  return {
+    ...enrichment,
+    blameStaleness: {
+      staleCount: observations.stale.length,
+      totalCount: observations.total,
+      allStaleAndUnmatched:
+        observations.stale.length === observations.total &&
+        observations.total > 0,
+      oldest,
+    },
+  };
 }
 
 function finaliseCulprit(

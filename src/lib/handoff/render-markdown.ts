@@ -92,7 +92,80 @@ function renderBestRead(packet: HandoffPacket): string {
     lines.push("", culpritChip);
   }
 
+  // Phase 2.10.1: stack-frame blame staleness. Two rendering modes:
+  //   - Strong: NO culprit and every stack blame is stale and
+  //     unmatched → prominent "probably not a recent regression"
+  //     note. This is an explicit signal to the receiver that the
+  //     bisect-recent-commits playbook is unlikely to help.
+  //   - Muted: some stale blames exist but we have a culprit OR some
+  //     stack blames were fresh → side-note. The culprit chip is
+  //     still the headline; we just want the agent to know the
+  //     staleness context exists.
+  const stalenessChip = formatBlameStalenessNote(packet, {
+    hasCulprit: Boolean(culpritChip),
+  });
+  if (stalenessChip) {
+    lines.push("", stalenessChip);
+  }
+
   return lines.join("\n");
+}
+
+/// Renders the Phase 2.10.1 staleness note when `repoContext.blameStaleness`
+/// is populated. The renderer picks tone based on whether the packet
+/// also carries a culprit pick — a strong-tone note would undermine a
+/// high-confidence culprit chip sitting right above it.
+///
+/// Returns "" when there's no staleness data to surface.
+function formatBlameStalenessNote(
+  packet: HandoffPacket,
+  params: { hasCulprit: boolean }
+): string {
+  const ctx = packet.repoContext;
+  const staleness = ctx?.blameStaleness;
+  if (!staleness) return "";
+
+  const { oldest, staleCount, totalCount, allStaleAndUnmatched } = staleness;
+
+  // Format age as "unknown" / "~N days" / "~N months" / "~N years"
+  // at roughly human resolution. Infinity → undated blame.
+  const ageDescription = (() => {
+    if (!Number.isFinite(oldest.ageDays)) return "unknown date";
+    const days = Math.round(oldest.ageDays);
+    if (days < 60) return `~${days} days ago`;
+    const months = Math.round(days / 30);
+    if (months < 24) return `~${months} months ago`;
+    const years = Math.round(months / 12);
+    return `~${years} years ago`;
+  })();
+
+  const locationLink = formatRepoLocationLink(
+    { file: oldest.file, line: oldest.line },
+    ctx
+  );
+  const locationLabel = locationLink ?? `${oldest.file}:${oldest.line}`;
+  const author = oldest.authorLogin ? ` by @${oldest.authorLogin}` : "";
+
+  // Strong tone only fires when the signal is unambiguous:
+  //   - every observed stack blame was stale AND unmatched, AND
+  //   - we didn't manage to pick a culprit (if we did, the signals
+  //     contradict each other and we err on the side of surfacing
+  //     both rather than overriding).
+  const strong = allStaleAndUnmatched && !params.hasCulprit;
+  if (strong) {
+    return wrap(
+      `**No recent culprit:** every stack-frame blame is older than the regression window — oldest is ${locationLabel} (last changed ${ageDescription}${author}). Likely not a recent-commit regression; consider infra, data, config, or traffic-pattern changes instead.`
+    );
+  }
+
+  // Muted form: side-note next to the culprit chip (or standalone
+  // when some stack blames are fresh but the regression ranker
+  // didn't surface a confident pick).
+  const fraction =
+    staleCount === totalCount ? `all ${totalCount}` : `${staleCount} of ${totalCount}`;
+  return wrap(
+    `**Blame staleness:** ${fraction} stack frame${totalCount === 1 ? "" : "s"} were last changed >30 days ago — oldest is ${locationLabel} (${ageDescription}${author}).`
+  );
 }
 
 /// Renders the `repoContext.likelyCulprit` chip, e.g.:

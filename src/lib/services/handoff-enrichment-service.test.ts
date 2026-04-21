@@ -55,14 +55,20 @@ import {
   getFileBlameRanges,
   listCommitsForPath,
 } from "@/lib/github/client";
-import type { HandoffPacketInput } from "@/lib/handoff/packet";
+import type {
+  HandoffPacketInput,
+  RepoEnrichmentInput,
+} from "@/lib/handoff/packet";
 import { prisma } from "@/lib/prisma";
 import {
   isRepoSnapshotStale,
   syncRepoTree,
 } from "@/lib/services/repo-index-service";
 
-import { loadRepoEnrichmentForCase } from "./handoff-enrichment-service";
+import {
+  applyBlameStaleness,
+  loadRepoEnrichmentForCase,
+} from "./handoff-enrichment-service";
 
 const caseFindUnique = prisma.targCase.findUnique as unknown as ReturnType<typeof vi.fn>;
 const repoLinkFindMany = prisma.targRepoLink.findMany as unknown as ReturnType<typeof vi.fn>;
@@ -1415,5 +1421,332 @@ describe("loadRepoEnrichmentForCase", () => {
     const loc = result?.evidenceLocations?.["ev-1"]?.[0];
     expect(loc?.blame?.commitSha).toBe("fallback");
     expect(loc?.blame?.author).toBe("carol");
+  });
+});
+
+// ===========================================================================
+// Phase 2.10.1 — blame staleness integration
+// ===========================================================================
+//
+// These tests cover the end-to-end service flow: stack-frame blame
+// attributions that DON'T match any suspected regression AND are older
+// than the 30-day staleness threshold should flow through as
+// `blameStaleness` on the enrichment. They reuse the same
+// primeEnrichedCase() / githubAccountFindUnique mocks as the rest of
+// the suite — the goal is to exercise the new collector, not re-prove
+// the rest of the pipeline.
+
+describe("loadRepoEnrichmentForCase — phase 2.10.1 blame staleness", () => {
+  // Helpers local to this describe: the fixtures above all prime
+  // ONE file (`src/lib/checkout.ts`). That's exactly the file the
+  // evidenceVM stack-frame points at, so the resolver produces a
+  // stack location with a line, which is what we need for the
+  // staleness collector.
+
+  function primeEnrichedCase() {
+    caseFindUnique.mockResolvedValueOnce({
+      workspaceId: "ws-1",
+      repoLinkId: "rlink-1",
+    });
+    repoLinkFindUnique.mockResolvedValueOnce(mockRepoLink());
+    repoFileFindMany.mockResolvedValueOnce([
+      mockFile("src/lib/checkout.ts"),
+    ]);
+    repoSymbolFindMany.mockResolvedValueOnce([]);
+  }
+
+  it("surfaces blameStaleness when the stack-frame blame is old AND not a suspected regression", async () => {
+    primeEnrichedCase();
+    githubAccountFindUnique.mockResolvedValueOnce({
+      accessTokenEnc: "encrypted-blob",
+    });
+    // Blame points at an ancient commit — 400 days old, well past
+    // the 30-day staleness threshold.
+    const ancient = new Date(Date.now() - 400 * 86_400_000).toISOString();
+    getBlameMock.mockResolvedValueOnce(
+      singleRangeBlame({
+        sha: "ancientsha",
+        message: "initial import",
+        authorLogin: "founder",
+        authorName: "Founder",
+        date: ancient,
+        htmlUrl: "https://github.com/acme/checkout/commit/ancientsha",
+      })
+    );
+    // suspectedRegressions is populated with a DIFFERENT (recent)
+    // commit — so the blame SHA is "unmatched" from the
+    // staleness collector's perspective.
+    listCommitsMock.mockResolvedValueOnce([
+      {
+        sha: "recent-sha",
+        message: "chore: recent but unrelated",
+        authorLogin: "alice",
+        authorName: "Alice",
+        authorEmail: null,
+        date: new Date(Date.now() - 86_400_000).toISOString(),
+        htmlUrl: "https://github.com/acme/checkout/commit/recent-sha",
+      },
+    ]);
+
+    const result = await loadRepoEnrichmentForCase({
+      userId: "u1",
+      caseId: "case-1",
+      input: sampleInput(),
+    });
+
+    expect(result?.blameStaleness).toBeDefined();
+    const s = result!.blameStaleness!;
+    expect(s.staleCount).toBeGreaterThanOrEqual(1);
+    expect(s.allStaleAndUnmatched).toBe(true);
+    expect(s.oldest.commitSha).toBe("ancientsha");
+    expect(s.oldest.file).toBe("src/lib/checkout.ts");
+    expect(s.oldest.ageDays).toBeGreaterThan(30);
+    expect(s.oldest.authorLogin).toBe("founder");
+  });
+
+  it("omits blameStaleness when the blamed commit is recent (within 30 days)", async () => {
+    // Fresh blame is not a staleness signal at all, even if it's
+    // unmatched. Covers the common case: a file changed last week
+    // but wasn't flagged as a regression candidate for some
+    // other reason (e.g. the regression ranker only ships top-N).
+    primeEnrichedCase();
+    githubAccountFindUnique.mockResolvedValueOnce({
+      accessTokenEnc: "encrypted-blob",
+    });
+    const recent = new Date(Date.now() - 5 * 86_400_000).toISOString();
+    getBlameMock.mockResolvedValueOnce(
+      singleRangeBlame({
+        sha: "fresh-sha",
+        message: "refactor: checkout",
+        authorLogin: "bob",
+        authorName: "Bob",
+        date: recent,
+      })
+    );
+    listCommitsMock.mockResolvedValueOnce([
+      {
+        sha: "other-sha",
+        message: "chore: other",
+        authorLogin: "alice",
+        authorName: "Alice",
+        authorEmail: null,
+        date: recent,
+        htmlUrl: "https://github.com/acme/checkout/commit/other-sha",
+      },
+    ]);
+
+    const result = await loadRepoEnrichmentForCase({
+      userId: "u1",
+      caseId: "case-1",
+      input: sampleInput(),
+    });
+
+    expect(result?.blameStaleness).toBeUndefined();
+  });
+
+  it("omits blameStaleness when no GitHub token is connected", async () => {
+    // Baseline: no token → no blame data → nothing to summarise.
+    // Pre-2.10.1 behaviour is preserved verbatim for unauth'd
+    // workspaces.
+    primeEnrichedCase();
+    githubAccountFindUnique.mockResolvedValueOnce(null);
+
+    const result = await loadRepoEnrichmentForCase({
+      userId: "u1",
+      caseId: "case-1",
+      input: sampleInput(),
+    });
+
+    expect(result?.blameStaleness).toBeUndefined();
+  });
+});
+
+// ===========================================================================
+// Phase 2.10.1 — applyBlameStaleness unit tests
+// ===========================================================================
+//
+// Pure-function tests for the staleness collector. These exercise
+// branches that the integration tests above can't reach (e.g. the
+// defensive "matched sha" skip, which can't happen in the real
+// pipeline because the regression window is identical to the
+// staleness threshold) and lock in the "oldest" selection rule.
+
+describe("applyBlameStaleness", () => {
+  const NOW = new Date("2026-04-20T00:00:00Z");
+  const day = 86_400_000;
+
+  function staleLoc(
+    file: string,
+    line: number,
+    commitSha: string,
+    ageDays: number,
+    author: string | null = "alice"
+  ) {
+    return {
+      file,
+      line,
+      blame: {
+        author: author ?? "",
+        commitSha,
+        commitMessage: "x",
+        date: new Date(NOW.getTime() - ageDays * day).toISOString(),
+      },
+    };
+  }
+
+  it("returns the input unchanged when there are no stack or evidence locations", () => {
+    const input: RepoEnrichmentInput = {
+      repoFullName: "a/b",
+      ref: "deadbeef",
+    };
+    const result = applyBlameStaleness(input, { now: NOW });
+    expect(result).toBe(input);
+  });
+
+  it("skips blame whose sha matches a suspected regression (defensive — can't happen in prod but explicit)", () => {
+    // In practice the 30-day regression window equals the staleness
+    // threshold, so a blame that's stale can never ALSO be a
+    // regression. But at the collector level we want the defensive
+    // check to be real — future changes to either window should
+    // keep the invariant that matched sha never shows up in
+    // staleness.
+    const result = applyBlameStaleness(
+      {
+        repoFullName: "a/b",
+        ref: "deadbeef",
+        stackLocations: [staleLoc("src/a.ts", 10, "matched", 100)],
+        suspectedRegressions: [
+          {
+            sha: "matched",
+            message: "x",
+            author: "alice",
+            date: new Date(NOW.getTime() - 5 * day).toISOString(),
+            touchedFiles: ["src/a.ts"],
+          },
+        ],
+      },
+      { now: NOW }
+    );
+    expect(result.blameStaleness).toBeUndefined();
+  });
+
+  it("picks the OLDEST stale blame for the oldest field, not the first one seen", () => {
+    const result = applyBlameStaleness(
+      {
+        repoFullName: "a/b",
+        ref: "deadbeef",
+        stackLocations: [
+          staleLoc("src/a.ts", 1, "recent-stale", 45),
+          staleLoc("src/b.ts", 2, "ancient", 900),
+          staleLoc("src/c.ts", 3, "middle", 120),
+        ],
+      },
+      { now: NOW }
+    );
+    expect(result.blameStaleness?.oldest.commitSha).toBe("ancient");
+    expect(result.blameStaleness?.oldest.file).toBe("src/b.ts");
+    expect(result.blameStaleness?.staleCount).toBe(3);
+    expect(result.blameStaleness?.allStaleAndUnmatched).toBe(true);
+  });
+
+  it("deduplicates (file, line, sha) across stackLocations and evidenceLocations", () => {
+    // Same frame can appear in both stackLocations (aggregated at
+    // the top of repoContext) and evidenceLocations (per evidence
+    // item). Without dedup we'd double-count and inflate
+    // staleCount / totalCount.
+    const loc = staleLoc("src/a.ts", 10, "old", 100);
+    const result = applyBlameStaleness(
+      {
+        repoFullName: "a/b",
+        ref: "deadbeef",
+        stackLocations: [loc],
+        evidenceLocations: { "ev-1": [loc] },
+      },
+      { now: NOW }
+    );
+    expect(result.blameStaleness?.staleCount).toBe(1);
+    expect(result.blameStaleness?.totalCount).toBe(1);
+  });
+
+  it("sets allStaleAndUnmatched=false when some blame is fresh", () => {
+    const result = applyBlameStaleness(
+      {
+        repoFullName: "a/b",
+        ref: "deadbeef",
+        stackLocations: [
+          staleLoc("src/a.ts", 1, "old", 100),
+          staleLoc("src/b.ts", 2, "fresh", 5),
+        ],
+      },
+      { now: NOW }
+    );
+    expect(result.blameStaleness?.staleCount).toBe(1);
+    expect(result.blameStaleness?.totalCount).toBe(2);
+    expect(result.blameStaleness?.allStaleAndUnmatched).toBe(false);
+  });
+
+  it("treats unparseable blame dates as maximally stale (Infinity ageDays)", () => {
+    const result = applyBlameStaleness(
+      {
+        repoFullName: "a/b",
+        ref: "deadbeef",
+        stackLocations: [
+          {
+            file: "src/a.ts",
+            line: 10,
+            blame: {
+              author: "alice",
+              commitSha: "undated",
+              commitMessage: "historical import",
+              date: "not a real date",
+            },
+          },
+        ],
+      },
+      { now: NOW }
+    );
+    expect(result.blameStaleness?.oldest.ageDays).toBe(Infinity);
+    expect(result.blameStaleness?.oldest.commitSha).toBe("undated");
+  });
+
+  it("ignores locations without a line number (we need a line to be 'a stack frame')", () => {
+    // Path-only locations shouldn't count: we can't cite
+    // "file.ts:undefined (last changed ...)" in the renderer, and
+    // path-only locations typically come from affectedArea (which
+    // isn't really a stack frame in the same sense).
+    const result = applyBlameStaleness(
+      {
+        repoFullName: "a/b",
+        ref: "deadbeef",
+        stackLocations: [
+          {
+            file: "src/a.ts",
+            blame: {
+              author: "alice",
+              commitSha: "old",
+              commitMessage: "x",
+              date: new Date(NOW.getTime() - 100 * day).toISOString(),
+            },
+          },
+        ],
+      },
+      { now: NOW }
+    );
+    expect(result.blameStaleness).toBeUndefined();
+  });
+
+  it("normalises empty author strings to null in the oldest record", () => {
+    // Packet consumers distinguish "no author" from "empty author"
+    // via `null`; an empty string would confuse the renderer
+    // (which checks `authorLogin ? "by @..." : ""`).
+    const result = applyBlameStaleness(
+      {
+        repoFullName: "a/b",
+        ref: "deadbeef",
+        stackLocations: [staleLoc("src/a.ts", 10, "old", 100, "")],
+      },
+      { now: NOW }
+    );
+    expect(result.blameStaleness?.oldest.authorLogin).toBeNull();
   });
 });

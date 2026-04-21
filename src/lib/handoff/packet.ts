@@ -84,6 +84,16 @@ export type HandoffPacket = {
     /// claim). Always references a `sha` that exists in
     /// `suspectedRegressions` — invariant 11 enforces this.
     likelyCulprit?: LikelyCulprit;
+    /// Phase 2.10.1. Summary of stack-frame blame that points at
+    /// commits OUTSIDE the recent-regression window. When populated,
+    /// the renderer emits a note steering the receiver away from
+    /// "revert the recent commit" reasoning — the stack frames were
+    /// last touched long ago, so the bug is more likely to be
+    /// environmental (infra/data/config change) than a recent code
+    /// regression. Omitted when every stack blame is either recent
+    /// or matches a suspected regression. See `BlameStaleness` for
+    /// detailed semantics.
+    blameStaleness?: BlameStaleness;
   };
 
   priors?: PriorCase[];
@@ -148,6 +158,56 @@ export type CommitRef = {
   prNumber?: number;
   url?: string;
   touchedFiles: string[];
+};
+
+/// Phase 2.10.1. Describes stack-frame blame staleness for the packet.
+///
+/// Rationale: the regression window is short (default 30 days). If every
+/// stack frame's current blame points at commits older than that, the
+/// bug isn't a recent code regression — something else changed (infra,
+/// data, config, traffic pattern). Surfacing this explicitly steers the
+/// receiver away from "bisect recent commits" strategies that would
+/// waste time.
+///
+/// Populated only when at least one stale-and-unmatched blame was
+/// observed. "Unmatched" = the blamed sha is not in the current
+/// `suspectedRegressions`. Stale blame that DOES match a regression
+/// is handled by the existing Phase 2.10 blame chip (and isn't
+/// counted here — it's not evidence against recency).
+export type BlameStaleness = {
+  /// Total number of stack-frame (file, line) blame records that
+  /// were both stale (older than the staleness threshold) AND
+  /// unmatched (the blamed sha isn't in `suspectedRegressions`).
+  /// At least 1 when this object is populated at all.
+  staleCount: number;
+  /// Total number of stack-frame blame records observed (stale +
+  /// fresh). Used by the renderer to say "N of M" when mixing
+  /// stale and fresh blame.
+  totalCount: number;
+  /// `true` when EVERY observed stack-frame blame was stale AND
+  /// unmatched. This is the strong signal: the renderer surfaces
+  /// a prominent "probably not a recent-commit regression" note
+  /// instead of a muted side-note. `false` when at least one
+  /// stack frame was either fresh or matched a regression.
+  allStaleAndUnmatched: boolean;
+  /// Oldest stale-and-unmatched blame record, for display. Picked
+  /// as the single "most surprising" attribution — if the code
+  /// hasn't changed in years, that's the most emphatic evidence.
+  oldest: {
+    file: string;
+    line: number;
+    commitSha: string;
+    /// Days elapsed from the blame commit's date to the packet
+    /// generation time. `Infinity` for commits with unparseable
+    /// dates (renderer shows "unknown date"). Always ≥ the
+    /// staleness threshold.
+    ageDays: number;
+    /// Author login of the blamed commit, when known. `null` when
+    /// the blame record lacked author info (GraphQL hiccups,
+    /// historical commits). Renderer falls back to "unknown" in
+    /// that case rather than omitting the attribution entirely.
+    authorLogin: string | null;
+  };
 };
 
 /// Phase 2.7. Points at the most-likely-regression-causing commit among the
@@ -251,6 +311,13 @@ export type RepoEnrichmentInput = {
   /// Populated only when a candidate clears the medium-confidence
   /// threshold.
   likelyCulprit?: LikelyCulprit;
+  /// Phase 2.10.1. Summary of stale-and-unmatched stack-frame blame.
+  /// Populated by the service layer from blame on `stackLocations` (+
+  /// per-evidence `evidenceLocations`). Passed through to
+  /// `repoContext.blameStaleness` verbatim when at least one stale
+  /// unmatched blame was observed — otherwise omitted. See
+  /// `BlameStaleness` for semantics.
+  blameStaleness?: BlameStaleness;
 };
 
 // ---------------------------------------------------------------------------
@@ -771,6 +838,13 @@ export function buildHandoffPacket(input: HandoffPacketInput): HandoffPacket {
             ? { suspectedRegressions: regressions }
             : {}),
           ...(culprit ? { likelyCulprit: culprit } : {}),
+          // Phase 2.10.1: pass staleness through verbatim. The
+          // enrichment service has already filtered to "at least 1
+          // stale unmatched blame" before populating it, so if
+          // present it's meaningful to render.
+          ...(enrichment.blameStaleness
+            ? { blameStaleness: enrichment.blameStaleness }
+            : {}),
         };
         return { repoContext: ctx };
       }
@@ -1072,6 +1146,67 @@ export function assertPacketValid(
         throw new HandoffPacketInvariantError(
           "likely_culprit_must_match_regression",
           `repoContext.likelyCulprit.sha "${culprit.sha}" does not match any suspectedRegressions[*].sha. The culprit must be one of the listed regressions so receivers can audit it.`
+        );
+      }
+    }
+
+    // Invariant 12 (Phase 2.10.1): blame staleness, when present, must
+    // describe a real observation. Counts have to be coherent, the
+    // "all stale" flag has to match the counts, and `oldest` needs
+    // the fields the renderer relies on. Failing closed on malformed
+    // staleness prevents the renderer from producing misleading
+    // notices like "0 of 3 stack frames are stale" (which would be
+    // actively confusing — the whole point is to be a strong hint).
+    if (packet.repoContext.blameStaleness) {
+      const s = packet.repoContext.blameStaleness;
+      if (!Number.isInteger(s.staleCount) || s.staleCount < 1) {
+        throw new HandoffPacketInvariantError(
+          "blame_staleness_count_required",
+          `repoContext.blameStaleness.staleCount must be a positive integer; got ${s.staleCount}. Omit the field entirely when no stale blame was observed.`
+        );
+      }
+      if (!Number.isInteger(s.totalCount) || s.totalCount < s.staleCount) {
+        throw new HandoffPacketInvariantError(
+          "blame_staleness_totals_coherent",
+          `repoContext.blameStaleness.totalCount (${s.totalCount}) must be an integer ≥ staleCount (${s.staleCount}).`
+        );
+      }
+      if (typeof s.allStaleAndUnmatched !== "boolean") {
+        throw new HandoffPacketInvariantError(
+          "blame_staleness_flag_required",
+          "repoContext.blameStaleness.allStaleAndUnmatched must be a boolean."
+        );
+      }
+      if (s.allStaleAndUnmatched !== (s.staleCount === s.totalCount)) {
+        throw new HandoffPacketInvariantError(
+          "blame_staleness_flag_consistent",
+          `repoContext.blameStaleness.allStaleAndUnmatched (${s.allStaleAndUnmatched}) must equal (staleCount === totalCount) (${s.staleCount === s.totalCount}).`
+        );
+      }
+      if (
+        typeof s.oldest.file !== "string" ||
+        s.oldest.file.trim().length === 0 ||
+        typeof s.oldest.commitSha !== "string" ||
+        s.oldest.commitSha.trim().length === 0 ||
+        !Number.isInteger(s.oldest.line) ||
+        s.oldest.line <= 0
+      ) {
+        throw new HandoffPacketInvariantError(
+          "blame_staleness_oldest_required",
+          "repoContext.blameStaleness.oldest must have a non-empty file, a non-empty commitSha, and a positive integer line."
+        );
+      }
+      // `ageDays` may be `Infinity` (unparseable commit date) but
+      // never negative (would imply a future date which our clock
+      // override allows in tests but not production).
+      if (
+        typeof s.oldest.ageDays !== "number" ||
+        Number.isNaN(s.oldest.ageDays) ||
+        s.oldest.ageDays < 0
+      ) {
+        throw new HandoffPacketInvariantError(
+          "blame_staleness_age_required",
+          `repoContext.blameStaleness.oldest.ageDays must be a non-negative number (Infinity allowed); got ${s.oldest.ageDays}.`
         );
       }
     }

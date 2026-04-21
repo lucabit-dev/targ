@@ -1114,3 +1114,333 @@ describe("phase 2.7 — invariants", () => {
     ).toThrow(/likely_culprit_must_match_regression/);
   });
 });
+
+// =============================================================================
+// Phase 2.10.1 — blame staleness rendering
+// =============================================================================
+
+describe("phase 2.10.1 — blame staleness rendering", () => {
+  function buildStalenessPacket(
+    staleness: NonNullable<
+      NonNullable<ReturnType<typeof buildHandoffPacket>["repoContext"]>["blameStaleness"]
+    >,
+    options: { withCulprit?: boolean } = {}
+  ) {
+    const sha = "stalepacketsha00000000000000000000000cafe";
+    return buildHandoffPacket({
+      ...CONTRADICTION_FIXTURE_INPUT,
+      repoEnrichment: {
+        repoFullName: "acme/checkout",
+        ref: "deadbeef0000000000000000000000000000cafe",
+        ...(options.withCulprit
+          ? {
+              suspectedRegressions: [
+                {
+                  sha,
+                  message: "fix: unrelated thing",
+                  author: "alice",
+                  date: new Date(Date.now() - 86_400_000).toISOString(),
+                  prNumber: 999,
+                  url: `https://github.com/acme/checkout/commit/${sha}`,
+                  touchedFiles: ["src/checkout.ts"],
+                },
+              ],
+              likelyCulprit: {
+                sha,
+                confidence: "high",
+                reasons: ["matches affected area"],
+              },
+            }
+          : {}),
+        blameStaleness: staleness,
+      },
+    });
+  }
+
+  it("renders a strong 'No recent culprit' note when every stack blame is stale and no culprit is picked", () => {
+    const markdown = renderPacketMarkdown(
+      buildStalenessPacket({
+        staleCount: 3,
+        totalCount: 3,
+        allStaleAndUnmatched: true,
+        oldest: {
+          file: "src/api/handler.ts",
+          line: 120,
+          commitSha: "ancient",
+          ageDays: 900,
+          authorLogin: "founder",
+        },
+      })
+    );
+    expect(markdown).toContain("**No recent culprit:**");
+    expect(markdown).toContain("src/api/handler.ts");
+    // ~30 months / ~2 years bucketing (900 days).
+    expect(markdown).toMatch(/~(?:\d+ months|\d+ years) ago/);
+    expect(markdown).toContain("@founder");
+    // Steers the receiver — the actionable advice is the whole point.
+    expect(markdown).toContain("infra");
+  });
+
+  it("renders a muted 'Blame staleness' side-note when a culprit is also present", () => {
+    const markdown = renderPacketMarkdown(
+      buildStalenessPacket(
+        {
+          staleCount: 2,
+          totalCount: 3,
+          allStaleAndUnmatched: false,
+          oldest: {
+            file: "src/util.ts",
+            line: 10,
+            commitSha: "old-sha",
+            ageDays: 95,
+            authorLogin: "alice",
+          },
+        },
+        { withCulprit: true }
+      )
+    );
+    // Side-note format — never undermines the culprit chip.
+    expect(markdown).toContain("**Blame staleness:**");
+    expect(markdown).toContain("2 of 3 stack frames");
+    // Muted tone must NOT contain the strong steer.
+    expect(markdown).not.toContain("**No recent culprit:**");
+    expect(markdown).not.toContain("infra, data, config");
+  });
+
+  it("falls back to the muted side-note when allStaleAndUnmatched is true but a culprit was picked anyway", () => {
+    // Edge case: the regression ranker surfaced a culprit via
+    // file-hit / keyword signals even though blame on the stack
+    // points elsewhere. We don't want a strong "no regression"
+    // note to directly contradict the culprit chip right above it
+    // — the two signals disagree and we surface both rather than
+    // picking sides.
+    const markdown = renderPacketMarkdown(
+      buildStalenessPacket(
+        {
+          staleCount: 2,
+          totalCount: 2,
+          allStaleAndUnmatched: true,
+          oldest: {
+            file: "src/a.ts",
+            line: 1,
+            commitSha: "old",
+            ageDays: 400,
+            authorLogin: "bob",
+          },
+        },
+        { withCulprit: true }
+      )
+    );
+    expect(markdown).toContain("**Blame staleness:**");
+    expect(markdown).not.toContain("**No recent culprit:**");
+  });
+
+  it("singularises 'stack frame' when totalCount === 1", () => {
+    const markdown = renderPacketMarkdown(
+      buildStalenessPacket({
+        staleCount: 1,
+        totalCount: 1,
+        allStaleAndUnmatched: true,
+        oldest: {
+          file: "src/a.ts",
+          line: 42,
+          commitSha: "old",
+          ageDays: 45,
+          authorLogin: null,
+        },
+      })
+    );
+    // 1 frame → "every stack-frame blame" works; the "N stack
+    // frames" muted form is singularised, but we're in strong
+    // form here. Just check we don't say "stack frames" (plural).
+    expect(markdown).toContain("stack-frame blame");
+    expect(markdown).not.toContain("1 stack frames");
+  });
+
+  it("surfaces 'unknown date' when the oldest blame has Infinity ageDays", () => {
+    // Unparseable blame date → ageDays = Infinity. Renderer should
+    // cope gracefully rather than emitting "~Infinity days ago".
+    const markdown = renderPacketMarkdown(
+      buildStalenessPacket({
+        staleCount: 1,
+        totalCount: 1,
+        allStaleAndUnmatched: true,
+        oldest: {
+          file: "src/a.ts",
+          line: 10,
+          commitSha: "undated",
+          ageDays: Infinity,
+          authorLogin: null,
+        },
+      })
+    );
+    expect(markdown).toContain("unknown date");
+    expect(markdown).not.toContain("Infinity");
+  });
+
+  it("handles missing authorLogin without emitting a stray 'by @'", () => {
+    const markdown = renderPacketMarkdown(
+      buildStalenessPacket({
+        staleCount: 1,
+        totalCount: 1,
+        allStaleAndUnmatched: true,
+        oldest: {
+          file: "src/a.ts",
+          line: 10,
+          commitSha: "sha",
+          ageDays: 100,
+          authorLogin: null,
+        },
+      })
+    );
+    // No "by @" substring — the render path must skip the author
+    // clause entirely when we don't have an attribution.
+    expect(markdown).not.toContain("by @");
+  });
+
+  it("emits nothing when blameStaleness is absent", () => {
+    // Baseline: pre-2.10.1 packets have no staleness field and
+    // should render exactly the same as before. Plain packet with
+    // no repo enrichment is the simplest version of this contract.
+    const markdown = renderPacketMarkdown(
+      buildHandoffPacket(CONTRADICTION_FIXTURE_INPUT)
+    );
+    expect(markdown).not.toContain("**No recent culprit:**");
+    expect(markdown).not.toContain("**Blame staleness:**");
+  });
+});
+
+// =============================================================================
+// Phase 2.10.1 — blame staleness invariants
+// =============================================================================
+
+describe("phase 2.10.1 — blame staleness invariants", () => {
+  function packetWithStaleness(
+    override: Partial<
+      NonNullable<
+        NonNullable<ReturnType<typeof buildHandoffPacket>["repoContext"]>["blameStaleness"]
+      >
+    > = {}
+  ) {
+    const base = buildHandoffPacket({
+      ...CONTRADICTION_FIXTURE_INPUT,
+      repoEnrichment: {
+        repoFullName: "acme/checkout",
+        ref: "deadbeef0000000000000000000000000000cafe",
+        blameStaleness: {
+          staleCount: 1,
+          totalCount: 1,
+          allStaleAndUnmatched: true,
+          oldest: {
+            file: "src/a.ts",
+            line: 10,
+            commitSha: "x",
+            ageDays: 100,
+            authorLogin: null,
+          },
+        },
+      },
+    });
+    if (base.repoContext?.blameStaleness) {
+      base.repoContext.blameStaleness = {
+        ...base.repoContext.blameStaleness,
+        ...(override as object),
+      } as NonNullable<typeof base.repoContext.blameStaleness>;
+    }
+    return base;
+  }
+
+  it("accepts a well-formed blameStaleness summary", () => {
+    expect(() =>
+      assertPacketValid(packetWithStaleness(), knownEvidenceIdsFromInput())
+    ).not.toThrow();
+  });
+
+  it("rejects a staleness with a non-positive staleCount", () => {
+    expect(() =>
+      assertPacketValid(
+        packetWithStaleness({ staleCount: 0 }),
+        knownEvidenceIdsFromInput()
+      )
+    ).toThrow(/blame_staleness_count_required/);
+  });
+
+  it("rejects a staleness with totalCount < staleCount", () => {
+    expect(() =>
+      assertPacketValid(
+        packetWithStaleness({ staleCount: 3, totalCount: 2 }),
+        knownEvidenceIdsFromInput()
+      )
+    ).toThrow(/blame_staleness_totals_coherent/);
+  });
+
+  it("rejects a staleness whose allStaleAndUnmatched flag is inconsistent with the counts", () => {
+    // staleCount 2, totalCount 3 → not all-stale, but flag says
+    // true. This is the foot-gun case where callers eyeballed the
+    // data wrong — invariant catches it.
+    expect(() =>
+      assertPacketValid(
+        packetWithStaleness({
+          staleCount: 2,
+          totalCount: 3,
+          allStaleAndUnmatched: true,
+        }),
+        knownEvidenceIdsFromInput()
+      )
+    ).toThrow(/blame_staleness_flag_consistent/);
+  });
+
+  it("rejects a staleness whose oldest.line is non-positive", () => {
+    expect(() =>
+      assertPacketValid(
+        packetWithStaleness({
+          oldest: {
+            file: "src/a.ts",
+            line: 0,
+            commitSha: "x",
+            ageDays: 100,
+            authorLogin: null,
+          },
+        }),
+        knownEvidenceIdsFromInput()
+      )
+    ).toThrow(/blame_staleness_oldest_required/);
+  });
+
+  it("accepts Infinity as ageDays (undated blame)", () => {
+    // Explicit: the invariant is "non-negative number", and
+    // Infinity is a number (NOT NaN), so this must pass. Regression
+    // guard — earlier drafts rejected Infinity.
+    expect(() =>
+      assertPacketValid(
+        packetWithStaleness({
+          oldest: {
+            file: "src/a.ts",
+            line: 10,
+            commitSha: "x",
+            ageDays: Infinity,
+            authorLogin: null,
+          },
+        }),
+        knownEvidenceIdsFromInput()
+      )
+    ).not.toThrow();
+  });
+
+  it("rejects NaN ageDays", () => {
+    expect(() =>
+      assertPacketValid(
+        packetWithStaleness({
+          oldest: {
+            file: "src/a.ts",
+            line: 10,
+            commitSha: "x",
+            ageDays: Number.NaN,
+            authorLogin: null,
+          },
+        }),
+        knownEvidenceIdsFromInput()
+      )
+    ).toThrow(/blame_staleness_age_required/);
+  });
+});
