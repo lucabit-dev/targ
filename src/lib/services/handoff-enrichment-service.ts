@@ -35,8 +35,11 @@ import {
   type EnrichmentContext,
 } from "@/lib/handoff/repo-enrichment";
 import {
+  getFileBlameRanges,
   GithubApiError,
   listCommitsForPath,
+  type GithubBlameResult,
+  type GithubCommitSummary,
 } from "@/lib/github/client";
 import { prisma } from "@/lib/prisma";
 import {
@@ -195,6 +198,7 @@ async function applyBlameEnrichment(params: {
     if (process.env.NODE_ENV !== "production") {
       console.info(`${LOG_PREFIX} blame enrichment ok`, {
         filesQueried: result.filesQueried.length,
+        locationsBlamed: result.locationsBlamed,
         suspectedRegressions:
           result.enrichment.suspectedRegressions?.length ?? 0,
       });
@@ -210,19 +214,33 @@ async function applyBlameEnrichment(params: {
 }
 
 /// Builds a `BlameContext` that:
-///   - caches `listCommitsForPath` results in-process for the current
-///     handoff (multiple locations on the same file → one API call);
-///   - enforces a file budget (`BLAME_FILE_BUDGET`) so packets with many
-///     locations don't explode the GitHub cost;
-///   - enforces a per-call concurrency cap (`BLAME_CONCURRENCY`);
-///   - enforces a per-call timeout (`BLAME_FETCH_TIMEOUT_MS`).
+///   - resolves per-line blame via GitHub's GraphQL `blame` endpoint
+///     (Phase 2.6) — different lines on the same file get distinct
+///     attribution. The full file's blame ranges come back in one query
+///     and are cached in-process, so multiple lines on the same file
+///     reuse a single network call.
+///   - falls back to file-level blame (most-recent commit on the file)
+///     when a `RepoLocation` has no `line`, or when no range covers the
+///     requested line (e.g. the snapshot drifted from the live ref).
+///   - aggregates suspected regressions via REST list-commits, cached
+///     per-file (multiple locations on the same file → one API call).
+///   - enforces a hard file budget (`BLAME_FILE_BUDGET`) on each query
+///     family independently — a packet with 8 distinct files will issue
+///     up to 8 GraphQL blame calls AND 8 REST list-commits calls, capped.
+///   - enforces a per-call concurrency cap (`BLAME_CONCURRENCY`).
+///   - enforces a per-call timeout (`BLAME_FETCH_TIMEOUT_MS`) via
+///     AbortController so a single slow file doesn't block the handoff.
 function buildBlameContext(params: {
   token: string;
   repoLink: PickedRepoLink["repoLink"];
 }): BlameContext {
   const { token, repoLink } = params;
-  const cache = new Map<string, Promise<BlameCommit[]>>();
-  let budgetRemaining = BLAME_FILE_BUDGET;
+
+  const blameRangesCache = new Map<string, Promise<GithubBlameResult>>();
+  const recentCommitsCache = new Map<string, Promise<BlameCommit[]>>();
+  let blameBudgetRemaining = BLAME_FILE_BUDGET;
+  let recentBudgetRemaining = BLAME_FILE_BUDGET;
+
   let inFlight = 0;
   const waiters: Array<() => void> = [];
 
@@ -241,7 +259,7 @@ function buildBlameContext(params: {
     if (next) next();
   }
 
-  async function fetchOne(path: string): Promise<BlameCommit[]> {
+  async function withTimeout<T>(fn: () => Promise<T>): Promise<T> {
     await acquireSlot();
     try {
       const controller = new AbortController();
@@ -249,6 +267,37 @@ function buildBlameContext(params: {
         () => controller.abort(),
         BLAME_FETCH_TIMEOUT_MS
       );
+      try {
+        return await fn();
+      } finally {
+        clearTimeout(timer);
+      }
+    } finally {
+      releaseSlot();
+    }
+  }
+
+  async function fetchBlameRanges(path: string): Promise<GithubBlameResult> {
+    return withTimeout(async () => {
+      try {
+        return await getFileBlameRanges(
+          token,
+          repoLink.ownerLogin,
+          repoLink.repoName,
+          repoLink.latestSnapshotCommitSha,
+          path
+        );
+      } catch (error) {
+        if (error instanceof GithubApiError && error.status === 404) {
+          return { ranges: [], mostRecentCommit: null };
+        }
+        throw error;
+      }
+    });
+  }
+
+  async function fetchRecentCommits(path: string): Promise<BlameCommit[]> {
+    return withTimeout(async () => {
       try {
         const commits = await listCommitsForPath(
           token,
@@ -260,46 +309,72 @@ function buildBlameContext(params: {
             perPage: BLAME_COMMITS_PER_FILE,
           }
         );
-        return commits.map((c) => ({
-          sha: c.sha,
-          message: c.message,
-          authorLogin: c.authorLogin,
-          authorName: c.authorName,
-          date: c.date,
-          htmlUrl: c.htmlUrl,
-        }));
-      } finally {
-        clearTimeout(timer);
+        return commits.map(toBlameCommit);
+      } catch (error) {
+        if (error instanceof GithubApiError && error.status === 404) {
+          return [];
+        }
+        throw error;
       }
-    } catch (error) {
-      if (error instanceof GithubApiError && error.status === 404) {
-        // File was renamed/removed between snapshot and blame fetch. Treat
-        // as "no blame" rather than failing the whole enrichment.
-        return [];
-      }
-      // Any other GitHub error (rate limit, network) should surface to the
-      // adapter, which catches per-file rejections and continues.
-      throw error;
-    } finally {
-      releaseSlot();
+    });
+  }
+
+  function getBlameRanges(file: string): Promise<GithubBlameResult> {
+    const cached = blameRangesCache.get(file);
+    if (cached) return cached;
+    if (blameBudgetRemaining <= 0) {
+      const empty: GithubBlameResult = { ranges: [], mostRecentCommit: null };
+      const promise = Promise.resolve(empty);
+      blameRangesCache.set(file, promise);
+      return promise;
     }
+    blameBudgetRemaining -= 1;
+    const promise = fetchBlameRanges(file);
+    blameRangesCache.set(file, promise);
+    return promise;
   }
 
   return {
-    listCommitsForPath: (path) => {
-      const cached = cache.get(path);
+    resolveLineBlame: async (file, line) => {
+      const ranges = await getBlameRanges(file);
+      // When the location has a line, look up the range that covers it.
+      // GraphQL blame ranges are contiguous and sorted, so a linear scan is
+      // fine for the small N (a few dozen ranges per file at most).
+      if (line !== undefined) {
+        const range = ranges.ranges.find(
+          (r) => line >= r.startingLine && line <= r.endingLine
+        );
+        if (range) return toBlameCommit(range.commit);
+      }
+      // Path-only location, or line out of range → file-level fallback.
+      return ranges.mostRecentCommit
+        ? toBlameCommit(ranges.mostRecentCommit)
+        : null;
+    },
+    listRecentCommits: (file) => {
+      const cached = recentCommitsCache.get(file);
       if (cached) return cached;
-      if (budgetRemaining <= 0) {
-        // Over budget — pretend this file has no blame data.
+      if (recentBudgetRemaining <= 0) {
         const empty = Promise.resolve<BlameCommit[]>([]);
-        cache.set(path, empty);
+        recentCommitsCache.set(file, empty);
         return empty;
       }
-      budgetRemaining -= 1;
-      const promise = fetchOne(path);
-      cache.set(path, promise);
+      recentBudgetRemaining -= 1;
+      const promise = fetchRecentCommits(file);
+      recentCommitsCache.set(file, promise);
       return promise;
     },
+  };
+}
+
+function toBlameCommit(c: GithubCommitSummary): BlameCommit {
+  return {
+    sha: c.sha,
+    message: c.message,
+    authorLogin: c.authorLogin,
+    authorName: c.authorName,
+    date: c.date,
+    htmlUrl: c.htmlUrl,
   };
 }
 

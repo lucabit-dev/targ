@@ -20,8 +20,10 @@ import type {
 
 import {
   collectUniqueFiles,
+  collectUniqueLocationKeys,
   enrichBlame,
   extractPrNumber,
+  keyOf,
   rankSuspectedRegressions,
   type BlameCommit,
   type BlameContext,
@@ -56,9 +58,28 @@ function loc(file: string, line?: number): RepoLocation {
   return line !== undefined ? { file, line } : { file };
 }
 
+/// Builds a `BlameContext` that mirrors the file-level Phase 2.5 behaviour:
+/// `resolveLineBlame` returns the first commit in the file's response (i.e.
+/// the most-recent commit), regardless of line. Used for tests that don't
+/// care about the line-level distinction.
 function fakeCtx(responses: Record<string, BlameCommit[]>): BlameContext {
   return {
-    listCommitsForPath: async (path) => responses[path] ?? [],
+    resolveLineBlame: async (file) => responses[file]?.[0] ?? null,
+    listRecentCommits: async (file) => responses[file] ?? [],
+  };
+}
+
+/// Builds a `BlameContext` whose `resolveLineBlame` returns DIFFERENT
+/// commits for different lines on the same file. Used for the Phase 2.6
+/// line-level tests that prove distinct lines get distinct attribution.
+function lineLevelCtx(
+  blameByLocation: Record<string, BlameCommit | null>,
+  recentCommits: Record<string, BlameCommit[]> = {}
+): BlameContext {
+  return {
+    resolveLineBlame: async (file, line) =>
+      blameByLocation[`${file}:${line ?? ""}`] ?? null,
+    listRecentCommits: async (file) => recentCommits[file] ?? [],
   };
 }
 
@@ -116,6 +137,44 @@ describe("collectUniqueFiles", () => {
 
   it("returns an empty list when no locations are set", () => {
     expect(collectUniqueFiles(enrichment())).toEqual([]);
+  });
+});
+
+describe("collectUniqueLocationKeys", () => {
+  it("dedupes by (file, line) pair, not by file alone", () => {
+    const keys = collectUniqueLocationKeys(
+      enrichment({
+        affectedAreaLocation: loc("src/lib/a.ts"),
+        stackLocations: [
+          loc("src/lib/a.ts", 10),
+          loc("src/lib/a.ts", 10), // duplicate, dropped
+          loc("src/lib/a.ts", 20),
+        ],
+        evidenceLocations: {
+          "ev-1": [loc("src/lib/a.ts"), loc("src/lib/b.ts", 5)],
+        },
+      })
+    );
+    // Expected unique keys:
+    //   (a.ts, undefined)  — from affectedArea + ev-1 path-only
+    //   (a.ts, 10)         — from stack
+    //   (a.ts, 20)         — from stack
+    //   (b.ts, 5)          — from ev-1
+    expect(keys).toEqual([
+      { file: "src/lib/a.ts", line: undefined },
+      { file: "src/lib/a.ts", line: 10 },
+      { file: "src/lib/a.ts", line: 20 },
+      { file: "src/lib/b.ts", line: 5 },
+    ]);
+  });
+
+  it("keys are stable strings: file + null-byte + line (or empty string)", () => {
+    expect(keyOf({ file: "x.ts", line: 42 })).toBe("x.ts\u000042");
+    expect(keyOf({ file: "x.ts", line: undefined })).toBe("x.ts\u0000");
+    // Different lines → different keys; same line → same key.
+    expect(keyOf({ file: "x.ts", line: 1 })).not.toBe(
+      keyOf({ file: "x.ts", line: 2 })
+    );
   });
 });
 
@@ -282,18 +341,28 @@ describe("enrichBlame", () => {
     });
   });
 
-  it("dedupes file queries so each distinct file is asked for once", async () => {
+  it("dedupes regression queries so each distinct file is asked for once", async () => {
     const listSpy = vi.fn(async (): Promise<BlameCommit[]> => []);
+    const blameSpy = vi.fn(async (): Promise<BlameCommit | null> => null);
     const input = enrichment({
       affectedAreaLocation: loc("src/lib/a.ts"),
+      // Same file with different lines — DIFFERENT blame lookups (line-level)
+      // but a SINGLE recent-commits lookup (regression aggregation is
+      // file-level).
       stackLocations: [loc("src/lib/a.ts", 10), loc("src/lib/a.ts", 20)],
       evidenceLocations: {
         "ev-1": [loc("src/lib/a.ts", 30)],
       },
     });
-    await enrichBlame(input, { listCommitsForPath: listSpy });
+    await enrichBlame(input, {
+      resolveLineBlame: blameSpy,
+      listRecentCommits: listSpy,
+    });
     expect(listSpy).toHaveBeenCalledTimes(1);
     expect(listSpy).toHaveBeenCalledWith("src/lib/a.ts");
+    // 4 distinct (file, line) keys: (a.ts, undefined), (a.ts, 10),
+    // (a.ts, 20), (a.ts, 30). Each gets its own blame call.
+    expect(blameSpy).toHaveBeenCalledTimes(4);
   });
 
   it("continues gracefully when one file's lookup throws", async () => {
@@ -303,14 +372,13 @@ describe("enrichBlame", () => {
     });
 
     const ctx: BlameContext = {
-      listCommitsForPath: async (path) => {
-        if (path === "src/lib/a.ts") throw new Error("rate limited");
-        return [
-          commit({
-            sha: "sha-b",
-            date: "2026-04-19T00:00:00Z",
-          }),
-        ];
+      resolveLineBlame: async (file) => {
+        if (file === "src/lib/a.ts") throw new Error("rate limited");
+        return commit({ sha: "sha-b", date: "2026-04-19T00:00:00Z" });
+      },
+      listRecentCommits: async (file) => {
+        if (file === "src/lib/a.ts") throw new Error("rate limited");
+        return [commit({ sha: "sha-b", date: "2026-04-19T00:00:00Z" })];
       },
     };
 
@@ -319,6 +387,84 @@ describe("enrichBlame", () => {
     expect(result.enrichment.affectedAreaLocation?.blame).toBeUndefined();
     expect(result.enrichment.stackLocations?.[0].blame?.commitSha).toBe("sha-b");
     expect(result.filesQueried).toEqual(["src/lib/b.ts"]);
+  });
+
+  // -----------------------------------------------------------------------
+  // Phase 2.6 — line-level blame
+  // -----------------------------------------------------------------------
+
+  it("attaches DIFFERENT blame to two locations on the same file with different lines", async () => {
+    const input = enrichment({
+      stackLocations: [loc("src/lib/a.ts", 10), loc("src/lib/a.ts", 50)],
+    });
+    const ctx = lineLevelCtx({
+      "src/lib/a.ts:10": commit({ sha: "early", authorLogin: "alice" }),
+      "src/lib/a.ts:50": commit({ sha: "later", authorLogin: "bob" }),
+    });
+    const result = await enrichBlame(input, ctx);
+    expect(result.enrichment.stackLocations?.[0].blame?.commitSha).toBe("early");
+    expect(result.enrichment.stackLocations?.[0].blame?.author).toBe("alice");
+    expect(result.enrichment.stackLocations?.[1].blame?.commitSha).toBe("later");
+    expect(result.enrichment.stackLocations?.[1].blame?.author).toBe("bob");
+    expect(result.locationsBlamed).toBe(2);
+  });
+
+  it("falls back to file-level blame for path-only locations (line undefined)", async () => {
+    const input = enrichment({
+      affectedAreaLocation: loc("src/lib/a.ts"),
+    });
+    const ctx = lineLevelCtx({
+      // The (file, undefined) key resolves to whatever the closure decides
+      // — typically "most recent commit on the whole file".
+      "src/lib/a.ts:": commit({ sha: "file-level", authorLogin: "alice" }),
+    });
+    const result = await enrichBlame(input, ctx);
+    expect(result.enrichment.affectedAreaLocation?.blame?.commitSha).toBe(
+      "file-level"
+    );
+  });
+
+  it("does not double-count lines on the same file in the regression hit count", async () => {
+    const input = enrichment({
+      // Two distinct (file, line) entries on the SAME file → blame fans
+      // out per line, but `commitsByFile` for regression scoring still has
+      // one entry → fileHitCount = 1.
+      stackLocations: [loc("src/a.ts", 10), loc("src/a.ts", 50)],
+    });
+    const shared = commit({
+      sha: "shared",
+      message: "fix: hot path (#7)",
+      date: new Date(Date.now() - 86_400_000).toISOString(),
+    });
+    const ctx: BlameContext = {
+      resolveLineBlame: async () => shared,
+      listRecentCommits: async () => [shared],
+    };
+    const result = await enrichBlame(input, ctx);
+    expect(result.enrichment.suspectedRegressions?.[0]).toMatchObject({
+      sha: "shared",
+      // touchedFiles has just one file, despite two (file, line) hits.
+      touchedFiles: ["src/a.ts"],
+    });
+  });
+
+  it("reports locationsBlamed independently from filesQueried", async () => {
+    const input = enrichment({
+      stackLocations: [
+        loc("src/a.ts", 10),
+        loc("src/a.ts", 20),
+        loc("src/b.ts", 30),
+      ],
+    });
+    const ctx: BlameContext = {
+      resolveLineBlame: async (file, line) =>
+        commit({ sha: `${file}-${line}` }),
+      listRecentCommits: async (file) => [commit({ sha: `recent-${file}` })],
+    };
+    const result = await enrichBlame(input, ctx);
+    expect(result.filesQueried.sort()).toEqual(["src/a.ts", "src/b.ts"]);
+    // 3 distinct (file, line) keys → 3 blame attributions.
+    expect(result.locationsBlamed).toBe(3);
   });
 
   it("populates suspectedRegressions from recent commits across files", async () => {

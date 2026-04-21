@@ -1,30 +1,34 @@
 /**
- * Handoff Packet blame enrichment (Phase 2.5).
+ * Handoff Packet blame enrichment (Phase 2.5 + 2.6).
  *
  * Pure adapter that decorates a `RepoEnrichmentInput` (Phase 2.3 output)
  * with commit-level provenance per resolved location:
  *
  *   - `RepoLocation.blame`  — "last changed by X · #842 · 2d ago" for every
- *     unique file referenced by the packet. We query GitHub once per file
- *     (NOT per location) and reuse the result for all locations pointing at
- *     that file.
+ *     resolved location. As of Phase 2.6, blame is **line-level** when the
+ *     location carries a `line` (using GitHub GraphQL blame ranges) and
+ *     falls back to file-level (the most recent commit on the whole file)
+ *     for path-only locations or when no range covers the requested line.
  *
  *   - `RepoEnrichmentInput.suspectedRegressions` — commits that touched any
  *     of the resolved files within the last N days, ranked by (a) how many
  *     resolved files the commit touched, then (b) recency. This is the "did
- *     X just break because of Y?" signal.
+ *     X just break because of Y?" signal. Computed file-level — different
+ *     lines on the same file collapse into one regression vote.
  *
  * What this module deliberately does NOT do:
- *   - Fetch commits. The caller injects a `listCommitsForPath` closure so
- *     unit tests don't hit the network and the service layer can apply
- *     concurrency / per-request caching.
- *   - Handle errors. The injected closure must decide between "throw" and
- *     "return empty"; this module treats an empty return as "no blame data
- *     for that file" and moves on.
+ *   - Fetch commits or blame. The caller injects two closures so unit tests
+ *     don't hit the network and the service layer can apply concurrency /
+ *     per-request caching:
+ *       * `resolveLineBlame(file, line?)`  — GitHub GraphQL blame
+ *       * `listRecentCommits(file)`         — GitHub REST list-commits
+ *   - Handle errors. The injected closures decide between "throw" and
+ *     "return null/[]"; this module treats null/[] as "no data" and moves
+ *     on. Per-file rejections never block other files (Promise.allSettled).
  *   - Render Markdown. That's `render-markdown.ts`.
  *
  * All public functions are deterministic given deterministic inputs — we
- * round all timestamps and compare files lexically when ranking ties.
+ * compare files lexically when ranking ties.
  */
 
 import type {
@@ -64,11 +68,23 @@ export type BlameCommit = {
 };
 
 export type BlameContext = {
-  /// Returns the most recent commits that touched `path`, newest first.
-  /// Expected to be idempotent from the caller's view — the service layer
-  /// should apply a per-request cache so multiple locations on the same
-  /// file don't fan out multiple API calls.
-  listCommitsForPath: (path: string) => Promise<BlameCommit[]>;
+  /// Resolves blame for a single `(file, line?)`. Should return the commit
+  /// that last modified the requested line (when `line` is given) or the
+  /// most recent commit on the file (when omitted, or when no range covers
+  /// the line). Return `null` when no data is available — the adapter
+  /// treats it as "skip blame for this location" rather than failing.
+  /// The service layer is expected to cache per-file blame across calls so
+  /// multiple lines on the same file don't fan out multiple API calls.
+  resolveLineBlame: (
+    file: string,
+    line: number | undefined
+  ) => Promise<BlameCommit | null>;
+
+  /// Returns the most recent commits that touched `file`, newest first.
+  /// Used for `suspectedRegressions` aggregation. Same caching contract as
+  /// `resolveLineBlame`. Return `[]` when no data is available.
+  listRecentCommits: (file: string) => Promise<BlameCommit[]>;
+
   /// Clock override used for the regression recency window. Defaults to
   /// `new Date()`. Exposed so tests (and deterministic re-runs of stored
   /// enrichments) can pin the window.
@@ -84,9 +100,14 @@ export type EnrichBlameResult = {
   /// that had a successful commit lookup, plus `suspectedRegressions`
   /// (when any commits qualify).
   enrichment: RepoEnrichmentInput;
-  /// Distinct file paths we queried commits for. Useful for observability
-  /// (e.g. logging "blame: 3 files, 2 regressions").
+  /// Distinct file paths we queried commits for (regression aggregation).
+  /// Useful for observability (e.g. logging "blame: 3 files, 2 regressions").
   filesQueried: string[];
+  /// Distinct (file, line) pairs we resolved blame for. Phase 2.6 metric —
+  /// when this is greater than `filesQueried.length`, line-level blame is
+  /// genuinely doing work (multiple lines on the same file got distinct
+  /// attributions).
+  locationsBlamed: number;
 };
 
 /// Adds blame metadata + suspected regressions to a `RepoEnrichmentInput`.
@@ -97,28 +118,47 @@ export async function enrichBlame(
 ): Promise<EnrichBlameResult> {
   const files = collectUniqueFiles(enrichment);
   if (files.length === 0) {
-    return { enrichment, filesQueried: [] };
+    return { enrichment, filesQueried: [], locationsBlamed: 0 };
   }
 
-  // Fan out queries. Use Promise.allSettled so a single failing file never
-  // takes the whole enrichment down.
-  const settled = await Promise.allSettled(
-    files.map(async (file) => ({
-      file,
-      commits: await ctx.listCommitsForPath(file),
+  // Phase 2.6: collect every distinct (file, line?) so we can resolve
+  // line-level blame. Different lines on the same file get separate
+  // attribution — multiple authors per file is the common case.
+  const locationKeys = collectUniqueLocationKeys(enrichment);
+
+  // Fan out blame lookups in parallel. The service layer's BlameContext is
+  // expected to cache per-file blame so multiple keys on the same file
+  // share one network call.
+  const blameSettled = await Promise.allSettled(
+    locationKeys.map(async (key) => ({
+      key,
+      commit: await ctx.resolveLineBlame(key.file, key.line),
     }))
   );
 
-  // Map every file we successfully looked up to its top commit (= blame)
-  // and aggregate commits for regression scoring.
-  const blameByFile = new Map<string, CommitToBlame>();
-  const commitsByFile = new Map<string, BlameCommit[]>();
+  // Map: locationKey-string => blame. Keyed by the same `keyOf` we use when
+  // attaching blame to locations during the rebuild.
+  const blameByKey = new Map<string, CommitToBlame>();
+  for (const result of blameSettled) {
+    if (result.status !== "fulfilled") continue;
+    const { key, commit } = result.value;
+    if (!commit) continue;
+    blameByKey.set(keyOf(key), toBlame(commit));
+  }
 
-  for (const result of settled) {
+  // Regression aggregation is still file-level — different lines on the
+  // same file shouldn't double-count toward `fileHitCount`.
+  const commitsSettled = await Promise.allSettled(
+    files.map(async (file) => ({
+      file,
+      commits: await ctx.listRecentCommits(file),
+    }))
+  );
+  const commitsByFile = new Map<string, BlameCommit[]>();
+  for (const result of commitsSettled) {
     if (result.status !== "fulfilled") continue;
     const { file, commits } = result.value;
     if (commits.length === 0) continue;
-    blameByFile.set(file, toBlame(commits[0]));
     commitsByFile.set(file, commits);
   }
 
@@ -126,16 +166,16 @@ export async function enrichBlame(
   // with the input (no extra fields, same order of arrays).
   const nextEvidenceLocations = enrichment.evidenceLocations
     ? mapRecord(enrichment.evidenceLocations, (locations) =>
-        locations.map((loc) => attachBlame(loc, blameByFile))
+        locations.map((loc) => attachBlame(loc, blameByKey))
       )
     : undefined;
 
   const nextAffectedArea = enrichment.affectedAreaLocation
-    ? attachBlame(enrichment.affectedAreaLocation, blameByFile)
+    ? attachBlame(enrichment.affectedAreaLocation, blameByKey)
     : undefined;
 
   const nextStackLocations = enrichment.stackLocations
-    ? enrichment.stackLocations.map((loc) => attachBlame(loc, blameByFile))
+    ? enrichment.stackLocations.map((loc) => attachBlame(loc, blameByKey))
     : undefined;
 
   const suspectedRegressions = rankSuspectedRegressions(
@@ -157,7 +197,8 @@ export async function enrichBlame(
 
   return {
     enrichment: nextEnrichment,
-    filesQueried: [...blameByFile.keys()],
+    filesQueried: [...commitsByFile.keys()],
+    locationsBlamed: blameByKey.size,
   };
 }
 
@@ -167,7 +208,8 @@ export async function enrichBlame(
 
 /// Collects every distinct file path from the enrichment. Order is
 /// deterministic: affected area first, then stack locations, then evidence
-/// locations by evidence-id key order.
+/// locations by evidence-id key order. Used for regression aggregation,
+/// which is file-level (not line-level).
 export function collectUniqueFiles(enrichment: RepoEnrichmentInput): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
@@ -187,6 +229,46 @@ export function collectUniqueFiles(enrichment: RepoEnrichmentInput): string[] {
     }
   }
   return out;
+}
+
+export type LocationKey = { file: string; line: number | undefined };
+
+/// Phase 2.6: every distinct (file, line?) pair from the enrichment. Two
+/// locations on the same file but different lines produce two keys — they
+/// will resolve to (potentially) different commits at the line granularity.
+/// Two locations on the same file with the SAME line collapse to one key.
+/// Path-only locations (line === undefined) produce a key with `line:
+/// undefined`, which the caller resolves as "most recent commit on the
+/// whole file".
+export function collectUniqueLocationKeys(
+  enrichment: RepoEnrichmentInput
+): LocationKey[] {
+  const seen = new Set<string>();
+  const out: LocationKey[] = [];
+
+  function add(loc: RepoLocation | undefined) {
+    if (!loc) return;
+    const key: LocationKey = { file: loc.file, line: loc.line };
+    const k = keyOf(key);
+    if (seen.has(k)) return;
+    seen.add(k);
+    out.push(key);
+  }
+
+  add(enrichment.affectedAreaLocation);
+  for (const loc of enrichment.stackLocations ?? []) add(loc);
+  if (enrichment.evidenceLocations) {
+    for (const key of Object.keys(enrichment.evidenceLocations)) {
+      for (const loc of enrichment.evidenceLocations[key]) add(loc);
+    }
+  }
+  return out;
+}
+
+/// Stable string key for a (file, line) pair. `line: undefined` collapses
+/// to a sentinel so all path-only locations on the same file dedupe.
+export function keyOf(key: LocationKey): string {
+  return `${key.file}\u0000${key.line ?? ""}`;
 }
 
 type CommitToBlame = NonNullable<RepoLocation["blame"]>;
@@ -216,9 +298,11 @@ export function extractPrNumber(message: string): number | null {
 
 function attachBlame(
   location: RepoLocation,
-  blameByFile: Map<string, CommitToBlame>
+  blameByKey: Map<string, CommitToBlame>
 ): RepoLocation {
-  const blame = blameByFile.get(location.file);
+  const blame = blameByKey.get(
+    keyOf({ file: location.file, line: location.line })
+  );
   if (!blame) return location;
   return { ...location, blame };
 }

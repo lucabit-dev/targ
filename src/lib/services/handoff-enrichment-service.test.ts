@@ -23,6 +23,9 @@ vi.mock("@/lib/services/repo-index-service", () => ({
 }));
 
 // Mock the GitHub client so blame enrichment has a deterministic surface.
+// Phase 2.6: `getFileBlameRanges` (GraphQL) drives per-line blame and the
+// file-level fallback. `listCommitsForPath` (REST) drives suspected
+// regressions only.
 vi.mock("@/lib/github/client", async () => {
   const actual = await vi.importActual<typeof import("@/lib/github/client")>(
     "@/lib/github/client"
@@ -30,6 +33,7 @@ vi.mock("@/lib/github/client", async () => {
   return {
     ...actual,
     listCommitsForPath: vi.fn(),
+    getFileBlameRanges: vi.fn(),
   };
 });
 
@@ -42,7 +46,7 @@ vi.mock("@/lib/crypto/token-cipher", () => ({
 
 import type { DiagnosisSnapshotViewModel } from "@/lib/analysis/view-model";
 import type { EvidenceViewModel } from "@/lib/evidence/view-model";
-import { listCommitsForPath } from "@/lib/github/client";
+import { getFileBlameRanges, listCommitsForPath } from "@/lib/github/client";
 import type { HandoffPacketInput } from "@/lib/handoff/packet";
 import { prisma } from "@/lib/prisma";
 import {
@@ -60,6 +64,7 @@ const repoSymbolFindMany = prisma.targRepoSymbol.findMany as unknown as ReturnTy
 const githubAccountFindUnique = prisma.targGithubAccount
   .findUnique as unknown as ReturnType<typeof vi.fn>;
 const listCommitsMock = listCommitsForPath as unknown as ReturnType<typeof vi.fn>;
+const getBlameMock = getFileBlameRanges as unknown as ReturnType<typeof vi.fn>;
 const isStaleMock = isRepoSnapshotStale as unknown as ReturnType<typeof vi.fn>;
 const syncTreeMock = syncRepoTree as unknown as ReturnType<typeof vi.fn>;
 
@@ -72,7 +77,36 @@ beforeEach(() => {
   // Default: no connected GitHub account, so blame enrichment short-circuits.
   githubAccountFindUnique.mockResolvedValue(null);
   listCommitsMock.mockResolvedValue([]);
+  getBlameMock.mockResolvedValue({ ranges: [], mostRecentCommit: null });
 });
+
+// Helper: builds a one-range GraphQL blame response covering a wide line
+// window so any reasonable `line` (1..1000) maps to the same commit. Use
+// for tests that don't care about line-level routing.
+function singleRangeBlame(
+  commit: {
+    sha: string;
+    message: string;
+    authorLogin?: string | null;
+    authorName?: string;
+    date?: string;
+    htmlUrl?: string;
+  }
+) {
+  const c = {
+    sha: commit.sha,
+    message: commit.message,
+    authorLogin: commit.authorLogin ?? null,
+    authorName: commit.authorName ?? "Author",
+    authorEmail: null,
+    date: commit.date ?? new Date(Date.now() - 86_400_000).toISOString(),
+    htmlUrl: commit.htmlUrl ?? `https://github.com/x/y/commit/${commit.sha}`,
+  };
+  return {
+    ranges: [{ startingLine: 1, endingLine: 1000, commit: c }],
+    mostRecentCommit: c,
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -372,6 +406,7 @@ describe("loadRepoEnrichmentForCase", () => {
     expect(result?.evidenceLocations?.["ev-1"]?.[0].blame).toBeUndefined();
     expect(result?.suspectedRegressions).toBeUndefined();
     expect(listCommitsMock).not.toHaveBeenCalled();
+    expect(getBlameMock).not.toHaveBeenCalled();
   });
 
   it("populates blame on resolved locations when a GitHub token is available", async () => {
@@ -379,6 +414,15 @@ describe("loadRepoEnrichmentForCase", () => {
     githubAccountFindUnique.mockResolvedValueOnce({
       accessTokenEnc: "encrypted-blob",
     });
+    getBlameMock.mockResolvedValueOnce(
+      singleRangeBlame({
+        sha: "abc123",
+        message: "fix: null check in checkout (#842)",
+        authorLogin: "alice",
+        authorName: "Alice",
+        htmlUrl: "https://github.com/acme/checkout/commit/abc123",
+      })
+    );
     listCommitsMock.mockResolvedValueOnce([
       {
         sha: "abc123",
@@ -410,11 +454,12 @@ describe("loadRepoEnrichmentForCase", () => {
     });
   });
 
-  it("gracefully degrades when listCommitsForPath throws", async () => {
+  it("gracefully degrades when both blame queries fail", async () => {
     primeEnrichedCase();
     githubAccountFindUnique.mockResolvedValueOnce({
       accessTokenEnc: "encrypted-blob",
     });
+    getBlameMock.mockRejectedValueOnce(new Error("graphql 502"));
     listCommitsMock.mockRejectedValueOnce(new Error("rate limited"));
 
     const result = await loadRepoEnrichmentForCase({
@@ -423,18 +468,19 @@ describe("loadRepoEnrichmentForCase", () => {
       input: sampleInput(),
     });
 
-    // Enrichment still ships, just without blame.
+    // Enrichment still ships, just without blame or regressions.
     expect(result?.ref).toBe("deadbeef");
     expect(result?.evidenceLocations?.["ev-1"]?.[0].blame).toBeUndefined();
     expect(result?.suspectedRegressions).toBeUndefined();
   });
 
-  it("calls list-commits with the snapshot's commit SHA as ref", async () => {
+  it("calls list-commits + get-blame with the snapshot's commit SHA as ref", async () => {
     primeEnrichedCase();
     githubAccountFindUnique.mockResolvedValueOnce({
       accessTokenEnc: "encrypted-blob",
     });
     listCommitsMock.mockResolvedValueOnce([]);
+    getBlameMock.mockResolvedValueOnce({ ranges: [], mostRecentCommit: null });
 
     await loadRepoEnrichmentForCase({
       userId: "u1",
@@ -449,5 +495,163 @@ describe("loadRepoEnrichmentForCase", () => {
       "src/lib/checkout.ts",
       expect.objectContaining({ ref: "deadbeef" })
     );
+    expect(getBlameMock).toHaveBeenCalledWith(
+      "ghu_fake_token",
+      "acme",
+      "checkout",
+      "deadbeef",
+      "src/lib/checkout.ts"
+    );
+  });
+
+  // ---------------------------------------------------------------------
+  // Phase 2.6 — line-level blame
+  // ---------------------------------------------------------------------
+
+  it("routes the location's line through the GraphQL blame ranges", async () => {
+    primeEnrichedCase();
+    githubAccountFindUnique.mockResolvedValueOnce({
+      accessTokenEnc: "encrypted-blob",
+    });
+    // Two distinct ranges in the file. The evidence stack frame points at
+    // line 42, which falls in range 11..100 → should attribute to
+    // commit `bob-late`, NOT `alice-early`.
+    getBlameMock.mockResolvedValueOnce({
+      ranges: [
+        {
+          startingLine: 1,
+          endingLine: 10,
+          commit: {
+            sha: "alice-early",
+            message: "initial",
+            authorLogin: "alice",
+            authorName: "Alice",
+            authorEmail: null,
+            date: "2026-04-01T00:00:00Z",
+            htmlUrl: "https://github.com/x/y/commit/alice-early",
+          },
+        },
+        {
+          startingLine: 11,
+          endingLine: 100,
+          commit: {
+            sha: "bob-late",
+            message: "fix: hot path (#9)",
+            authorLogin: "bob",
+            authorName: "Bob",
+            authorEmail: null,
+            date: "2026-04-15T00:00:00Z",
+            htmlUrl: "https://github.com/x/y/commit/bob-late",
+          },
+        },
+      ],
+      mostRecentCommit: {
+        sha: "bob-late",
+        message: "fix: hot path (#9)",
+        authorLogin: "bob",
+        authorName: "Bob",
+        authorEmail: null,
+        date: "2026-04-15T00:00:00Z",
+        htmlUrl: "https://github.com/x/y/commit/bob-late",
+      },
+    });
+    listCommitsMock.mockResolvedValueOnce([]);
+
+    const result = await loadRepoEnrichmentForCase({
+      userId: "u1",
+      caseId: "case-1",
+      input: sampleInput(),
+    });
+
+    const loc = result?.evidenceLocations?.["ev-1"]?.[0];
+    expect(loc?.line).toBe(42);
+    expect(loc?.blame).toMatchObject({
+      author: "bob",
+      commitSha: "bob-late",
+      prNumber: 9,
+    });
+  });
+
+  it("caches per-file blame so multiple lines on the same file share one GraphQL call", async () => {
+    primeEnrichedCase();
+    githubAccountFindUnique.mockResolvedValueOnce({
+      accessTokenEnc: "encrypted-blob",
+    });
+    getBlameMock.mockResolvedValue(
+      singleRangeBlame({
+        sha: "shared",
+        message: "init",
+        authorLogin: "alice",
+      })
+    );
+    listCommitsMock.mockResolvedValue([]);
+
+    // Override sample input to add a second evidence item with a frame on
+    // the same file but a different line, so we get TWO distinct
+    // (file, line) keys in the enrichment.
+    const input = sampleInput();
+    input.evidence.push(
+      evidenceVM({
+        id: "ev-2",
+        extracted: {
+          stackFrames: ["at bar (src/lib/checkout.ts:99:1)"],
+        },
+      })
+    );
+
+    await loadRepoEnrichmentForCase({
+      userId: "u1",
+      caseId: "case-1",
+      input,
+    });
+
+    // Despite (file, 42) and (file, 99) being distinct location keys, the
+    // service caches per FILE so getFileBlameRanges should be called once.
+    expect(getBlameMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to file-level blame when the line is outside all ranges", async () => {
+    primeEnrichedCase();
+    githubAccountFindUnique.mockResolvedValueOnce({
+      accessTokenEnc: "encrypted-blob",
+    });
+    // Range only covers lines 1..10 but the evidence points at line 42.
+    getBlameMock.mockResolvedValueOnce({
+      ranges: [
+        {
+          startingLine: 1,
+          endingLine: 10,
+          commit: {
+            sha: "early",
+            message: "early",
+            authorLogin: "alice",
+            authorName: "Alice",
+            authorEmail: null,
+            date: "2026-04-01T00:00:00Z",
+            htmlUrl: "https://github.com/x/y/commit/early",
+          },
+        },
+      ],
+      mostRecentCommit: {
+        sha: "fallback",
+        message: "later head",
+        authorLogin: "carol",
+        authorName: "Carol",
+        authorEmail: null,
+        date: "2026-04-18T00:00:00Z",
+        htmlUrl: "https://github.com/x/y/commit/fallback",
+      },
+    });
+    listCommitsMock.mockResolvedValueOnce([]);
+
+    const result = await loadRepoEnrichmentForCase({
+      userId: "u1",
+      caseId: "case-1",
+      input: sampleInput(),
+    });
+
+    const loc = result?.evidenceLocations?.["ev-1"]?.[0];
+    expect(loc?.blame?.commitSha).toBe("fallback");
+    expect(loc?.blame?.author).toBe("carol");
   });
 });
