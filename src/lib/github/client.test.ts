@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   exchangeCodeForToken,
   getAuthenticatedUser,
+  getFileBlameRanges,
   getRepo,
   GithubApiError,
   listCommitsForPath,
@@ -324,6 +325,191 @@ describe("github client", () => {
       );
       await expect(
         listCommitsForPath("tok", "octo", "missing", "x.ts")
+      ).rejects.toBeInstanceOf(GithubApiError);
+    });
+  });
+
+  describe("getFileBlameRanges", () => {
+    function blameResponse(
+      ranges: Array<{
+        startingLine: number;
+        endingLine: number;
+        oid: string;
+        messageHeadline: string;
+        committedDate: string;
+        url?: string;
+        login?: string | null;
+        name?: string | null;
+        email?: string | null;
+        prNumber?: number;
+      }>
+    ): Response {
+      return jsonResponse({
+        data: {
+          repository: {
+            object: {
+              blame: {
+                ranges: ranges.map((r) => ({
+                  startingLine: r.startingLine,
+                  endingLine: r.endingLine,
+                  commit: {
+                    oid: r.oid,
+                    messageHeadline: r.messageHeadline,
+                    committedDate: r.committedDate,
+                    url:
+                      r.url ?? `https://github.com/octo/repo/commit/${r.oid}`,
+                    author: {
+                      user: r.login ? { login: r.login } : null,
+                      name: r.name ?? r.login ?? "unknown",
+                      email: r.email ?? null,
+                    },
+                    associatedPullRequests: {
+                      nodes:
+                        r.prNumber !== undefined
+                          ? [{ number: r.prNumber }]
+                          : [],
+                    },
+                  },
+                })),
+              },
+            },
+          },
+        },
+      });
+    }
+
+    it("issues a POST to /graphql with the right variables and bearer auth", async () => {
+      fetchMock.mockResolvedValueOnce(blameResponse([]));
+
+      await getFileBlameRanges(
+        "ghu_tok",
+        "octo",
+        "repo",
+        "abc123",
+        "src/lib/x.ts"
+      );
+
+      const [url, init] = fetchMock.mock.calls[0];
+      expect(url).toBe("https://api.github.com/graphql");
+      expect(init.method).toBe("POST");
+      const headers = new Headers(init.headers);
+      expect(headers.get("Authorization")).toBe("Bearer ghu_tok");
+      expect(headers.get("Content-Type")).toBe("application/json");
+
+      const body = JSON.parse(String(init.body));
+      expect(body.variables).toEqual({
+        owner: "octo",
+        name: "repo",
+        oid: "abc123",
+        path: "src/lib/x.ts",
+      });
+      expect(body.query).toContain("blame(path: $path)");
+    });
+
+    it("normalises ranges, prefers login as author, and synthesizes (#PR) into message", async () => {
+      fetchMock.mockResolvedValueOnce(
+        blameResponse([
+          {
+            startingLine: 1,
+            endingLine: 10,
+            oid: "abc",
+            messageHeadline: "fix: null check",
+            committedDate: "2026-04-15T00:00:00Z",
+            login: "alice",
+            name: "Alice",
+            email: "alice@example.com",
+            prNumber: 842,
+          },
+          {
+            startingLine: 11,
+            endingLine: 20,
+            oid: "def",
+            messageHeadline: "refactor",
+            committedDate: "2026-04-10T00:00:00Z",
+            login: null,
+            name: "Bob",
+          },
+        ])
+      );
+
+      const result = await getFileBlameRanges(
+        "tok",
+        "octo",
+        "repo",
+        "ref",
+        "x.ts"
+      );
+
+      expect(result.ranges).toHaveLength(2);
+      expect(result.ranges[0]).toMatchObject({
+        startingLine: 1,
+        endingLine: 10,
+        commit: {
+          sha: "abc",
+          message: "fix: null check (#842)",
+          authorLogin: "alice",
+          authorName: "Alice",
+          authorEmail: "alice@example.com",
+        },
+      });
+      expect(result.ranges[1].commit.authorLogin).toBeNull();
+      expect(result.ranges[1].commit.authorName).toBe("Bob");
+      expect(result.ranges[1].commit.message).toBe("refactor");
+    });
+
+    it("computes mostRecentCommit by committedDate across ranges", async () => {
+      fetchMock.mockResolvedValueOnce(
+        blameResponse([
+          {
+            startingLine: 1,
+            endingLine: 10,
+            oid: "older",
+            messageHeadline: "old",
+            committedDate: "2026-04-01T00:00:00Z",
+            login: "alice",
+          },
+          {
+            startingLine: 11,
+            endingLine: 20,
+            oid: "newer",
+            messageHeadline: "new",
+            committedDate: "2026-04-19T00:00:00Z",
+            login: "bob",
+          },
+        ])
+      );
+      const result = await getFileBlameRanges("t", "o", "r", "ref", "x.ts");
+      expect(result.mostRecentCommit?.sha).toBe("newer");
+    });
+
+    it("returns an empty result when the file is missing at the ref", async () => {
+      fetchMock.mockResolvedValueOnce(
+        jsonResponse({
+          data: { repository: { object: null } },
+        })
+      );
+      const result = await getFileBlameRanges("t", "o", "r", "ref", "missing.ts");
+      expect(result.ranges).toEqual([]);
+      expect(result.mostRecentCommit).toBeNull();
+    });
+
+    it("surfaces GraphQL errors as GithubApiError", async () => {
+      fetchMock.mockResolvedValueOnce(
+        jsonResponse({
+          errors: [{ message: "Variable $oid is invalid" }],
+        })
+      );
+      await expect(
+        getFileBlameRanges("t", "o", "r", "bad", "x.ts")
+      ).rejects.toBeInstanceOf(GithubApiError);
+    });
+
+    it("throws GithubApiError on transport-level failure", async () => {
+      fetchMock.mockResolvedValueOnce(
+        jsonResponse({ message: "Bad credentials" }, 401)
+      );
+      await expect(
+        getFileBlameRanges("bad-tok", "o", "r", "ref", "x.ts")
       ).rejects.toBeInstanceOf(GithubApiError);
     });
   });

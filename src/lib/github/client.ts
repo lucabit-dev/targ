@@ -8,6 +8,7 @@
 import { GITHUB_TOKEN_URL } from "./oauth-config";
 
 const GITHUB_API_BASE = "https://api.github.com";
+const GITHUB_GRAPHQL_URL = `${GITHUB_API_BASE}/graphql`;
 const GITHUB_API_VERSION = "2022-11-28";
 const DEFAULT_ACCEPT = "application/vnd.github+json";
 
@@ -384,6 +385,198 @@ export async function listCommitsForPath(
   );
   const raw = (await response.json()) as GithubCommitApi[];
   return raw.map(normalizeCommit);
+}
+
+// ---------------------------------------------------------------------------
+// GraphQL — line-level blame (Phase 2.6)
+// ---------------------------------------------------------------------------
+
+/// One contiguous range of lines in a file that all share the same most-recent
+/// commit. The GraphQL `blame` query returns the file partitioned into these
+/// ranges, sorted by line. Callers locate a specific line by finding the range
+/// where `startingLine <= line <= endingLine`.
+export type GithubBlameRange = {
+  startingLine: number;
+  endingLine: number;
+  commit: GithubCommitSummary;
+};
+
+export type GithubBlameResult = {
+  ranges: GithubBlameRange[];
+  /// Most-recent commit across all ranges. Surface for callers that have a
+  /// `RepoLocation` without a `line` (path-only) so they can still attach a
+  /// "last touched" attribution at the file granularity. `null` when the
+  /// blame returned no ranges (empty file, file missing at the ref, etc.).
+  mostRecentCommit: GithubCommitSummary | null;
+};
+
+type GraphqlBlameResponse = {
+  data?: {
+    repository: {
+      object: {
+        blame: {
+          ranges: Array<{
+            startingLine: number;
+            endingLine: number;
+            commit: {
+              oid: string;
+              messageHeadline: string;
+              committedDate: string;
+              url: string;
+              author: {
+                user: { login: string } | null;
+                name: string | null;
+                email: string | null;
+              } | null;
+              associatedPullRequests: {
+                nodes: Array<{ number: number }>;
+              };
+            };
+          }>;
+        } | null;
+      } | null;
+    } | null;
+  };
+  errors?: Array<{ message: string; type?: string; path?: unknown }>;
+};
+
+const BLAME_GRAPHQL_QUERY = /* GraphQL */ `
+  query Blame($owner: String!, $name: String!, $oid: GitObjectID!, $path: String!) {
+    repository(owner: $owner, name: $name) {
+      object(oid: $oid) {
+        ... on Commit {
+          blame(path: $path) {
+            ranges {
+              startingLine
+              endingLine
+              commit {
+                oid
+                messageHeadline
+                committedDate
+                url
+                author {
+                  user { login }
+                  name
+                  email
+                }
+                associatedPullRequests(first: 1) {
+                  nodes { number }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+`;
+
+/// Fetches per-line blame for a file at a given commit SHA. Uses the GraphQL
+/// API because REST has no native blame endpoint. The whole file's blame
+/// comes back in one round-trip — for our use case (handoff packets with
+/// 1-3 lines per file of interest) one query per file is the right
+/// granularity, since multiple `(file, line)` lookups against the same
+/// file should reuse the same response.
+///
+/// Returns `{ ranges: [], mostRecentCommit: null }` when:
+///   - the file doesn't exist at that commit (renamed, deleted),
+///   - the ref points at a tree object that isn't a commit,
+///   - the GraphQL response shape is null in any expected layer.
+///
+/// Throws `GithubApiError` on transport-level failures (auth, 5xx,
+/// network) so the caller can decide whether to fall back or surface.
+export async function getFileBlameRanges(
+  token: string,
+  owner: string,
+  name: string,
+  ref: string,
+  path: string
+): Promise<GithubBlameResult> {
+  const response = await fetch(GITHUB_GRAPHQL_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: DEFAULT_ACCEPT,
+      "Content-Type": "application/json",
+      "User-Agent": "targ-app",
+    },
+    body: JSON.stringify({
+      query: BLAME_GRAPHQL_QUERY,
+      variables: { owner, name, oid: ref, path },
+    }),
+  });
+
+  if (!response.ok) {
+    let body: unknown = undefined;
+    try {
+      body = await response.json();
+    } catch {
+      body = await response.text().catch(() => undefined);
+    }
+    throw new GithubApiError(
+      response.status,
+      `GitHub GraphQL ${response.status}`,
+      body
+    );
+  }
+
+  const payload = (await response.json()) as GraphqlBlameResponse;
+
+  // GraphQL puts logical errors in `errors[]` even on a 200. Surface those
+  // as `GithubApiError` so callers can apply the same fallback policy as
+  // for REST errors.
+  if (payload.errors && payload.errors.length > 0) {
+    throw new GithubApiError(
+      200,
+      payload.errors[0].message,
+      payload.errors
+    );
+  }
+
+  const rawRanges = payload.data?.repository?.object?.blame?.ranges;
+  if (!rawRanges || rawRanges.length === 0) {
+    return { ranges: [], mostRecentCommit: null };
+  }
+
+  const ranges: GithubBlameRange[] = rawRanges.map((range) => {
+    const c = range.commit;
+    const login = c.author?.user?.login ?? null;
+    const name = c.author?.name ?? login ?? "unknown";
+    const pr = c.associatedPullRequests.nodes[0]?.number;
+    // Encode the PR number into the message text so downstream consumers
+    // that only have the message string (e.g. extractPrNumber) recover it
+    // — REST commit payloads naturally have `(#N)` in squash-merge
+    // messages, so we mirror that convention here for GraphQL commits.
+    const messageWithPr = pr
+      ? `${c.messageHeadline} (#${pr})`
+      : c.messageHeadline;
+    return {
+      startingLine: range.startingLine,
+      endingLine: range.endingLine,
+      commit: {
+        sha: c.oid,
+        message: messageWithPr,
+        authorLogin: login,
+        authorName: name,
+        authorEmail: c.author?.email ?? null,
+        date: c.committedDate,
+        htmlUrl: c.url,
+      },
+    };
+  });
+
+  const mostRecentCommit = ranges.reduce<GithubCommitSummary | null>(
+    (acc, range) => {
+      const ts = Date.parse(range.commit.date);
+      if (!Number.isFinite(ts)) return acc;
+      if (!acc) return range.commit;
+      const accTs = Date.parse(acc.date);
+      return ts > accTs ? range.commit : acc;
+    },
+    null
+  );
+
+  return { ranges, mostRecentCommit };
 }
 
 export type GithubOAuthTokenResponse = {
