@@ -237,12 +237,21 @@ async function applyCulpritDetection(params: {
     return enrichment;
   }
 
+  // Phase 2.10: blame attributions are collected from the already-
+  // enriched stack locations (Phase 2.6 runs before this). They're
+  // cheap to assemble (no I/O) and strengthen BOTH passes — we pass
+  // them into firstPass so a blame hit can single-handedly promote
+  // a commit to the top-K pulled for diff fetching.
+  const blameAttributions = collectBlameAttributions(enrichment);
+
   const baseSignals = {
     affectedArea: input.diagnosis.affectedArea,
     probableRootCause: input.diagnosis.probableRootCause,
     summary: input.diagnosis.summary,
     // Phase 2.8: contradictions feed the negative-evidence layer.
     contradictions: input.diagnosis.contradictions,
+    // Phase 2.10: blame × culprit cross-check.
+    blameAttributions,
   };
 
   let firstPass;
@@ -346,6 +355,42 @@ function collectResolvedStackLines(
       seen.add(key);
       out.push({ file: loc.file, line: loc.line });
     }
+  }
+  return out;
+}
+
+/// Harvests line-level blame attributions from enriched stack
+/// locations (Phase 2.6 populated `RepoLocation.blame` earlier in the
+/// pipeline). Each entry is passed through to the culprit scorer,
+/// which awards a large bonus whenever a suspected regression's SHA
+/// matches one of the blamed commits.
+///
+/// Dedupes by (file, line, sha) so the same stack frame surfacing
+/// in both `stackLocations` and per-evidence locations doesn't
+/// over-credit the blamed commit (the scorer already caps at one
+/// credit per commit, but keeping the signal clean at the source is
+/// cheaper than duplicated rationale reasons downstream).
+function collectBlameAttributions(
+  enrichment: RepoEnrichmentInput
+): Array<{ file: string; line: number; sha: string }> {
+  const out: Array<{ file: string; line: number; sha: string }> = [];
+  const seen = new Set<string>();
+  const ingest = (loc: {
+    file: string;
+    line?: number | null;
+    blame?: { commitSha?: string | null } | null;
+  }) => {
+    const line = loc.line;
+    const sha = loc.blame?.commitSha;
+    if (!sha || !line || !Number.isFinite(line) || line <= 0) return;
+    const key = `${loc.file}:${line}:${sha}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ file: loc.file, line, sha });
+  };
+  for (const loc of enrichment.stackLocations ?? []) ingest(loc);
+  for (const list of Object.values(enrichment.evidenceLocations ?? {})) {
+    for (const loc of list) ingest(loc);
   }
   return out;
 }

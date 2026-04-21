@@ -922,6 +922,92 @@ describe("phase 2.9 — diff-aware rendering", () => {
   });
 });
 
+// =============================================================================
+// Phase 2.10 — blame × culprit rendering
+// =============================================================================
+
+describe("phase 2.10 — blame × culprit rendering", () => {
+  function buildBlamePacket(reasons: string[]) {
+    const sha = "blamedsha00000000000000000000000000000cafe";
+    return buildHandoffPacket({
+      ...CONTRADICTION_FIXTURE_INPUT,
+      repoEnrichment: {
+        repoFullName: "acme/checkout",
+        ref: "deadbeef0000000000000000000000000000cafe",
+        suspectedRegressions: [
+          {
+            sha,
+            message: "fix: cache invalidation",
+            author: "alice",
+            date: new Date(Date.now() - 86_400_000).toISOString(),
+            prNumber: 842,
+            url: `https://github.com/acme/checkout/commit/${sha}`,
+            touchedFiles: ["src/cache.ts"],
+          },
+        ],
+        likelyCulprit: { sha, confidence: "high", reasons },
+      },
+    });
+  }
+
+  it("renders the blame-on reason when blame cross-checks the commit", () => {
+    const markdown = renderPacketMarkdown(
+      buildBlamePacket([
+        "matches affected area",
+        "blame on src/cache.ts:42 points to this commit",
+      ])
+    );
+    expect(markdown).toContain(
+      "blame on src/cache.ts:42 points to this commit"
+    );
+  });
+
+  it("blame match outranks generic positives in the chip (survives truncation)", () => {
+    // Blame must be in the first 3 slots regardless of how many
+    // other positives there are — it's the strongest evidence the
+    // scorer can produce.
+    const markdown = renderPacketMarkdown(
+      buildBlamePacket([
+        "matches affected area",
+        "matches probable root cause",
+        "touched 1 of 1 suspected file",
+        "merged 1 day ago",
+        "blame on src/cache.ts:42 points to this commit",
+      ])
+    );
+    const rationale =
+      markdown.match(/_\(([\s\S]+?)\)_/)?.[1].replace(/\s+/g, " ") ?? "";
+    expect(rationale).toContain("blame on");
+    // Blame must come before any generic positive in the joined
+    // rationale — the ordering contract guarantees this.
+    const parts = rationale.split(" · ");
+    const blameIdx = parts.findIndex((p) => p.startsWith("blame on"));
+    const areaIdx = parts.findIndex((p) => p.startsWith("matches "));
+    expect(blameIdx).toBeGreaterThanOrEqual(0);
+    expect(blameIdx).toBeLessThan(areaIdx);
+  });
+
+  it("ordering: negatives > blame > diff-touches > others", () => {
+    // When all four kinds co-exist, the 3-slot chip must show
+    // negative, then blame, then diff-touches (dropping generic
+    // positives). This is the full Phase 2.8/2.9/2.10 contract.
+    const markdown = renderPacketMarkdown(
+      buildBlamePacket([
+        "matches affected area",
+        "diff touches src/cache.ts:42 (stack frame)",
+        "but all touched files are tests",
+        "blame on src/cache.ts:42 points to this commit",
+      ])
+    );
+    const rationale =
+      markdown.match(/_\(([\s\S]+?)\)_/)?.[1].replace(/\s+/g, " ") ?? "";
+    const parts = rationale.split(" · ");
+    expect(parts[0].startsWith("but ")).toBe(true);
+    expect(parts[1].startsWith("blame on ")).toBe(true);
+    expect(parts[2].startsWith("diff touches ")).toBe(true);
+  });
+});
+
 describe("phase 2.7 — invariants", () => {
   function packetWithCulprit(
     culpritOverrides: Record<string, unknown> = {}

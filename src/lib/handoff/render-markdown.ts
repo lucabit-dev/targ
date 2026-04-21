@@ -128,22 +128,35 @@ function formatLikelyCulpritChip(packet: HandoffPacket): string {
   // rationale chip rather than the main statement. Trim the bullet list
   // to keep the chip a single visual line in most cases.
   //
-  // Phase 2.8: negative-evidence reasons (those starting with "but ")
-  // are the most important signal in the chip — they're the reason
-  // the culprit was demoted to "Possible". Surface them first so the
-  // .slice(0, 3) truncation can't drop them when there are 3+
-  // reasons. Order within each group is preserved. Priority order:
-  //   1. Negative reasons ("but ...") — must never be hidden, they
-  //      explain why confidence is capped.
-  //   2. Diff-aware line hits (Phase 2.9) — highest-precision positive
-  //      signal, most useful for the receiving agent.
-  //   3. Everything else (keyword / file / recency matches).
+  // Priority order — the .slice(0, 3) truncation below would silently
+  // drop the most important rationale bullets otherwise, so we sort
+  // BEFORE truncating:
+  //
+  //   1. Negative reasons ("but ...") — Phase 2.8. These explain why
+  //      a strong-looking commit was demoted to "Possible"; hiding
+  //      them would make the chip actively misleading.
+  //   2. Blame matches ("blame on X:Y points to this commit") — Phase
+  //      2.10. Highest-precision positive signal in the scorer (blame
+  //      is authoritative about line provenance), must survive
+  //      truncation to justify the confidence band.
+  //   3. Diff-aware line hits ("diff touches ...") — Phase 2.9/2.9.1.
+  //      Second-strongest positive signal; the receiving agent uses
+  //      this to jump directly to the changed line.
+  //   4. Everything else (keyword / file / recency matches). Useful
+  //      corroboration but recoverable from the raw commit metadata
+  //      in the packet if truncated out of the chip.
   const isNegative = (r: string) => r.startsWith("but ");
+  const isBlameMatch = (r: string) => r.startsWith("blame on ");
   const isDiffHit = (r: string) => r.startsWith("diff touches ");
+  const isPriority = (r: string) =>
+    isNegative(r) || isBlameMatch(r) || isDiffHit(r);
   const orderedReasons = [
     ...culprit.reasons.filter(isNegative),
-    ...culprit.reasons.filter((r) => !isNegative(r) && isDiffHit(r)),
-    ...culprit.reasons.filter((r) => !isNegative(r) && !isDiffHit(r)),
+    ...culprit.reasons.filter((r) => !isNegative(r) && isBlameMatch(r)),
+    ...culprit.reasons.filter(
+      (r) => !isNegative(r) && !isBlameMatch(r) && isDiffHit(r)
+    ),
+    ...culprit.reasons.filter((r) => !isPriority(r)),
   ];
   const reasons = orderedReasons.slice(0, 3).join(" \u00b7 ");
 

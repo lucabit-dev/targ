@@ -174,6 +174,33 @@ const DIFF_LINE_NEAR_WINDOW = 10;
 const W_DIFF_LINE_NEAR = 1;
 
 // ---------------------------------------------------------------------------
+// Phase 2.10 — blame × culprit cross-check
+// ---------------------------------------------------------------------------
+
+/// Bonus credit when line-level blame on an evidence stack frame
+/// points DIRECTLY at a suspected-regression commit. This is the
+/// strongest positive signal in the scorer: we're combining two
+/// independently-computed facts ("GitHub says this line was last
+/// touched by commit X" + "we independently flagged X as a recent
+/// commit in the relevant area") into a near-deterministic
+/// conclusion.
+///
+/// Weight is intentionally larger than the maximum possible sum of
+/// every other positive signal (area + cause + file + recency + diff
+/// hit ≈ 2 + 1.5 + 1.5 + 0.5 + 2 = 7.5... actually, blame still
+/// loses head-to-head against full corroboration. So we set
+/// W_BLAME_MATCH = 5 to guarantee blame alone clears MIN_SCORE_HIGH
+/// (= 4) AND outscores any blame-less commit that only has the
+/// keyword/file/recency cluster (area + file + recency ≤ 4.0).
+///
+/// Still credited additively rather than as a hard override so that
+/// a heavily-penalised blame match (e.g. the blamed commit is test-
+/// only but the problem is production) degrades gracefully to
+/// medium confidence with visible caveats, rather than silently
+/// promoting an obviously-wrong commit.
+const W_BLAME_MATCH = 5;
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -211,6 +238,19 @@ export type CulpritSignals = {
   /// the scorer stays pure and has no upstream dependency.
   /// Missing entries → no diff signal for that commit.
   diffProbesBySha?: Map<string, CommitDiffProbe>;
+  /// Phase 2.10. Line-level blame attributions for evidence stack
+  /// frames. Each entry says "as of HEAD, line `line` in `file` was
+  /// last modified by commit `sha`". Any suspected regression whose
+  /// SHA matches one of these attributions is promoted with a large
+  /// blame-match bonus — combining blame (authoritative ground truth
+  /// about line provenance) with the recent-commit signal is a
+  /// near-deterministic culprit indicator.
+  ///
+  /// Entries whose `sha` doesn't match any candidate are ignored.
+  /// Empty array / undefined → no blame signal applied (the packet
+  /// still renders fine via the existing Phase 2.6 blame chip on
+  /// resolved locations).
+  blameAttributions?: Array<{ file: string; line: number; sha: string }>;
   /// Clock override for the recency signal. Defaults to `new Date()`.
   now?: Date;
 };
@@ -276,6 +316,19 @@ export function detectLikelyCulprit(
     (s) => Number.isFinite(s.line) && s.line > 0
   );
   const diffProbesBySha = signals.diffProbesBySha;
+  // Phase 2.10: drop malformed blame entries (empty sha / blank file /
+  // non-positive line) so the scorer never awards a bonus against
+  // garbage attribution data. Keep the filter permissive enough that
+  // an occasional unusual path still survives.
+  const blameAttributions = (signals.blameAttributions ?? []).filter(
+    (b) =>
+      typeof b.sha === "string" &&
+      b.sha.length > 0 &&
+      typeof b.file === "string" &&
+      b.file.length > 0 &&
+      Number.isFinite(b.line) &&
+      b.line > 0
+  );
   // The diagnosis tokens tell us which kinds of files are legitimately
   // in-scope. If the affected area IS about tests, then test-only commits
   // shouldn't be demoted. Same for docs / config / platform scopes.
@@ -297,6 +350,7 @@ export function detectLikelyCulprit(
       diagnosisScopes,
       stackLines,
       diffProbesBySha,
+      blameAttributions,
       now,
     })
   );
@@ -412,6 +466,13 @@ type ScoreContext = {
   /// same. Individual misses (commit with no entry) just skip the
   /// bonus for that commit.
   diffProbesBySha: Map<string, CommitDiffProbe> | undefined;
+  /// Phase 2.10. Normalised line-level blame attributions. Each
+  /// entry's `sha` is matched against candidate commits; the first
+  /// match awards the W_BLAME_MATCH bonus and cites the (file, line)
+  /// pair in the reasons. Always defined (empty array when the
+  /// service had no blame data) so the scorer can treat it
+  /// uniformly.
+  blameAttributions: Array<{ file: string; line: number; sha: string }>;
   now: Date;
 };
 
@@ -576,6 +637,22 @@ function scoreCommit(commit: CommitRef, ctx: ScoreContext): ScoredCommit {
           `diff touches ${bestLine.file}:${bestLine.line} (stack frame, ±${bestDistance} lines)`
         );
       }
+    }
+  }
+
+  // Phase 2.10 — blame × culprit cross-check. When line-level blame
+  // on any stack frame points at THIS commit, award the strongest
+  // positive bonus in the scorer. Credit once per commit even if
+  // multiple blame entries point at it (extra confirmations are
+  // absorbed into the single reason citing the first match) — this
+  // keeps the score bounded and the chip readable.
+  if (ctx.blameAttributions.length > 0) {
+    const match = ctx.blameAttributions.find((b) => b.sha === commit.sha);
+    if (match) {
+      credit(W_BLAME_MATCH);
+      reasons.push(
+        `blame on ${match.file}:${match.line} points to this commit`
+      );
     }
   }
 

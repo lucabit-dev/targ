@@ -678,10 +678,13 @@ describe("loadRepoEnrichmentForCase", () => {
       accessTokenEnc: "encrypted-blob",
     });
     getBlameMock.mockResolvedValueOnce(
+      // Blame points at a commit NOT in the suspectedRegressions list
+      // so Phase 2.10's blame-match bonus doesn't apply — this test
+      // isolates the "no signal clears threshold" behaviour.
       singleRangeBlame({
-        sha: "noise",
-        message: "chore: bump dependency versions",
-        authorLogin: "carol",
+        sha: "unrelated-sha",
+        message: "doc: update readme",
+        authorLogin: "dave",
       })
     );
     // Make the regression touch a file the resolver did NOT pick up, and
@@ -843,13 +846,14 @@ describe("loadRepoEnrichmentForCase", () => {
     githubAccountFindUnique.mockResolvedValue({
       accessTokenEnc: "encrypted-blob",
     });
-    // Blame picks leader as the most-recent toucher of the file. Not
-    // critical for this test — we only care about regression ranking.
+    // Blame points at a commit NOT in the regression list so Phase
+    // 2.10's blame-match bonus doesn't corroborate leader-sha — this
+    // test isolates the diff-aware rerank signal.
     getBlameMock.mockResolvedValueOnce(
       singleRangeBlame({
-        sha: "leader-sha",
-        message: "refactor: checkout flow",
-        authorLogin: "alice",
+        sha: "prior-sha",
+        message: "initial checkout flow",
+        authorLogin: "original",
       })
     );
     const now = Date.now();
@@ -1108,6 +1112,152 @@ describe("loadRepoEnrichmentForCase", () => {
   });
 
   // -------------------------------------------------------------------------
+  // Phase 2.10 — blame × culprit cross-check (integration)
+  // -------------------------------------------------------------------------
+
+  it("promotes a commit when line-level blame on a stack frame points at it", async () => {
+    // Setup: two candidates, both touching the file, both with
+    // modest signal. Line-level blame on the stack frame at line 42
+    // points at `truth-sha`. Phase 2.10 awards W_BLAME_MATCH (+5)
+    // to truth-sha, which should unambiguously make it the pick at
+    // high confidence, even though `leader-sha` is newer.
+    caseFindUnique.mockResolvedValueOnce({
+      workspaceId: "ws-1",
+      repoLinkId: "rlink-1",
+    });
+    repoLinkFindUnique.mockResolvedValueOnce(mockRepoLink());
+    repoFileFindMany.mockResolvedValueOnce([mockFile("src/lib/checkout.ts")]);
+    repoSymbolFindMany.mockResolvedValueOnce([]);
+    githubAccountFindUnique.mockResolvedValue({
+      accessTokenEnc: "encrypted-blob",
+    });
+    // Blame for the stack frame @ line 42 points at truth-sha. This
+    // is the ground-truth signal: whatever changed line 42 most
+    // recently is, by definition, blame's current attribution.
+    getBlameMock.mockResolvedValueOnce(
+      singleRangeBlame({
+        sha: "truth-sha",
+        message: "fix: checkout submit null guard",
+        authorLogin: "bob",
+      })
+    );
+    const now = Date.now();
+    listCommitsMock.mockResolvedValueOnce([
+      {
+        sha: "leader-sha",
+        message: "refactor: checkout flow",
+        authorLogin: "alice",
+        authorName: "Alice",
+        authorEmail: null,
+        date: new Date(now - 1 * 86_400_000).toISOString(),
+        htmlUrl: "https://github.com/acme/checkout/commit/leader-sha",
+      },
+      {
+        sha: "truth-sha",
+        message: "fix: checkout submit null guard",
+        authorLogin: "bob",
+        authorName: "Bob",
+        authorEmail: null,
+        date: new Date(now - 3 * 86_400_000).toISOString(),
+        htmlUrl: "https://github.com/acme/checkout/commit/truth-sha",
+      },
+    ]);
+
+    const input = sampleInput();
+    input.evidence = [
+      evidenceVM({
+        extracted: {
+          stackFrames: ["at submit (src/lib/checkout.ts:42:3)"],
+        },
+      }),
+    ];
+    input.diagnosis = diagnosisVM({
+      affectedArea: "checkout flow",
+      probableRootCause: "submit helper breaks on null cart",
+    });
+
+    const result = await loadRepoEnrichmentForCase({
+      userId: "u1",
+      caseId: "case-1",
+      input,
+    });
+
+    expect(result?.likelyCulprit?.sha).toBe("truth-sha");
+    expect(result?.likelyCulprit?.confidence).toBe("high");
+    // Reason chip must surface the blame-match evidence so the
+    // receiver can see WHY the commit was picked.
+    expect(
+      result?.likelyCulprit?.reasons.some((r) =>
+        r.includes("blame on src/lib/checkout.ts:42 points to this commit")
+      )
+    ).toBe(true);
+  });
+
+  it("doesn't award blame credit when the blamed sha isn't among the regressions", async () => {
+    // The blamed sha is an old commit that falls outside the 30-day
+    // suspectedRegressions window. The regression list contains only
+    // `recent-sha`. Phase 2.10 must not spuriously promote the old
+    // commit (it isn't even in the candidate list) nor any other
+    // candidate — the blame bonus only applies to matching SHAs.
+    caseFindUnique.mockResolvedValueOnce({
+      workspaceId: "ws-1",
+      repoLinkId: "rlink-1",
+    });
+    repoLinkFindUnique.mockResolvedValueOnce(mockRepoLink());
+    repoFileFindMany.mockResolvedValueOnce([mockFile("src/lib/checkout.ts")]);
+    repoSymbolFindMany.mockResolvedValueOnce([]);
+    githubAccountFindUnique.mockResolvedValue({
+      accessTokenEnc: "encrypted-blob",
+    });
+    // Blame points at an ancient commit not in the regression list.
+    getBlameMock.mockResolvedValueOnce(
+      singleRangeBlame({
+        sha: "ancient-sha",
+        message: "initial implementation from 2019",
+        authorLogin: "founder",
+      })
+    );
+    const now = Date.now();
+    listCommitsMock.mockResolvedValueOnce([
+      {
+        sha: "recent-sha",
+        message: "fix: checkout",
+        authorLogin: "alice",
+        authorName: "Alice",
+        authorEmail: null,
+        date: new Date(now - 1 * 86_400_000).toISOString(),
+        htmlUrl: "https://github.com/acme/checkout/commit/recent-sha",
+      },
+    ]);
+
+    const input = sampleInput();
+    input.evidence = [
+      evidenceVM({
+        extracted: {
+          stackFrames: ["at submit (src/lib/checkout.ts:42:3)"],
+        },
+      }),
+    ];
+    input.diagnosis = diagnosisVM({ affectedArea: "checkout" });
+
+    const result = await loadRepoEnrichmentForCase({
+      userId: "u1",
+      caseId: "case-1",
+      input,
+    });
+
+    // recent-sha is still picked (it has keyword/file signal), but
+    // NO "blame on " reason — the blame attribution pointed
+    // elsewhere and was correctly ignored.
+    expect(result?.likelyCulprit?.sha).toBe("recent-sha");
+    expect(
+      result?.likelyCulprit?.reasons.every(
+        (r) => !r.startsWith("blame on ")
+      )
+    ).toBe(true);
+  });
+
+  // -------------------------------------------------------------------------
   // Phase 2.9.1 — near-hit proximity credit (integration)
   // -------------------------------------------------------------------------
 
@@ -1127,11 +1277,13 @@ describe("loadRepoEnrichmentForCase", () => {
     githubAccountFindUnique.mockResolvedValue({
       accessTokenEnc: "encrypted-blob",
     });
+    // Blame on an unrelated sha so Phase 2.10 doesn't corroborate
+    // either candidate — this test isolates the ±N proximity signal.
     getBlameMock.mockResolvedValueOnce(
       singleRangeBlame({
-        sha: "leader-sha",
-        message: "refactor: checkout",
-        authorLogin: "alice",
+        sha: "prior-sha",
+        message: "initial checkout",
+        authorLogin: "original",
       })
     );
     const now = Date.now();

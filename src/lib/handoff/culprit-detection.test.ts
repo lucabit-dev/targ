@@ -1267,3 +1267,219 @@ describe("detectLikelyCulprit — diff-aware proximity (Phase 2.9.1)", () => {
     expect(result.culprit).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase 2.10 — blame × culprit cross-check
+// ---------------------------------------------------------------------------
+
+describe("detectLikelyCulprit — blame cross-check (Phase 2.10)", () => {
+  it("promotes a commit whose sha matches a stack-frame blame attribution", () => {
+    // A commit that would otherwise score below MIN_SCORE_HIGH. With
+    // a blame match pointing at it, the scorer should pick it up and
+    // surface a "blame on ...:... points to this commit" reason.
+    const c = commit({
+      sha: "blamed",
+      message: "refactor: cache",
+      touchedFiles: ["src/cache.ts"],
+      date: "2026-04-19T00:00:00Z",
+    });
+    const result = detectLikelyCulprit([c], {
+      affectedArea: "cache",
+      blameAttributions: [
+        { file: "src/cache.ts", line: 42, sha: "blamed" },
+      ],
+      now: NOW,
+    });
+    expect(result.culprit?.sha).toBe("blamed");
+    expect(
+      result.culprit?.reasons.some((r) =>
+        r.includes("blame on src/cache.ts:42 points to this commit")
+      )
+    ).toBe(true);
+    // W_BLAME_MATCH = 4 alone is exactly MIN_SCORE_HIGH. Combined
+    // with area match (+2) the commit comfortably clears both
+    // threshold AND gap → "high" confidence.
+    expect(result.culprit?.confidence).toBe("high");
+  });
+
+  it("a blame match alone clears MIN_SCORE_HIGH — no keyword / file signal needed", () => {
+    // Worst-case candidate: no area/cause/file overlap, old date
+    // (no recency bonus). Nothing else would surface this commit.
+    // Blame alone should still push it to the chip at minimum
+    // "medium" — raw score = 4, no runner-up → "high" via gap.
+    const c = commit({
+      sha: "onlyblame",
+      message: "chore: bump deps",
+      touchedFiles: [],
+      date: "2020-01-01T00:00:00Z",
+    });
+    const result = detectLikelyCulprit([c], {
+      affectedArea: "checkout",
+      blameAttributions: [
+        { file: "src/a.ts", line: 99, sha: "onlyblame" },
+      ],
+      now: NOW,
+    });
+    expect(result.culprit?.sha).toBe("onlyblame");
+    expect(result.culprit?.reasons[0]).toMatch(/^blame on /);
+  });
+
+  it("picks the blame-matched commit over a better-scoring commit WITHOUT blame", () => {
+    // `stronger` has keyword match + file hit + recency → 2 (area)
+    // + 1.5 (file ratio 1/1) + 0.5 (recent) = 4.0 raw. `blamed` has
+    // only the blame match → W_BLAME_MATCH = 5.0. Blame must win
+    // head-to-head against the full keyword/file/recency ceiling,
+    // that's the whole point of Phase 2.10: blame is ground truth
+    // about line provenance and should outrank heuristic clusters.
+    const stronger = commit({
+      sha: "stronger",
+      message: "fix: checkout regression",
+      touchedFiles: ["src/checkout.ts"],
+      date: "2026-04-19T00:00:00Z",
+    });
+    const blamed = commit({
+      sha: "blamed",
+      message: "unrelated noise",
+      touchedFiles: [],
+      date: "2020-01-01T00:00:00Z",
+    });
+    const result = detectLikelyCulprit([stronger, blamed], {
+      affectedArea: "checkout flow",
+      resolvedFiles: ["src/checkout.ts"],
+      blameAttributions: [
+        { file: "src/checkout.ts", line: 42, sha: "blamed" },
+      ],
+      now: NOW,
+    });
+    expect(result.culprit?.sha).toBe("blamed");
+  });
+
+  it("ignores blame attributions whose sha doesn't match any candidate", () => {
+    const c = commit({
+      sha: "candidate",
+      message: "refactor: cache",
+      touchedFiles: ["src/cache.ts"],
+      date: "2026-04-19T00:00:00Z",
+    });
+    const result = detectLikelyCulprit([c], {
+      affectedArea: "cache",
+      blameAttributions: [
+        // SHA below ≠ candidate's sha → no credit.
+        { file: "src/cache.ts", line: 42, sha: "some-other-sha" },
+      ],
+      now: NOW,
+    });
+    expect(
+      result.culprit?.reasons.every((r) => !r.startsWith("blame on "))
+    ).toBe(true);
+  });
+
+  it("credits only one blame match per commit even with multiple matching attributions", () => {
+    // Two blame entries both point at the same commit. The scorer
+    // must credit W_BLAME_MATCH once (not 2x) — otherwise a single
+    // commit could accumulate unbounded score from repeated blame
+    // rows on the same stack.
+    const c = commit({
+      sha: "blamed",
+      message: "chore: unrelated",
+      touchedFiles: [],
+      date: "2020-01-01T00:00:00Z",
+    });
+    const result = detectLikelyCulprit([c], {
+      affectedArea: "unrelated-area",
+      blameAttributions: [
+        { file: "src/a.ts", line: 10, sha: "blamed" },
+        { file: "src/a.ts", line: 11, sha: "blamed" },
+        { file: "src/b.ts", line: 99, sha: "blamed" },
+      ],
+      now: NOW,
+    });
+    // Exactly one blame-on reason, even though three entries match.
+    const blameReasons = (result.culprit?.reasons ?? []).filter((r) =>
+      r.startsWith("blame on ")
+    );
+    expect(blameReasons.length).toBe(1);
+  });
+
+  it("filters out malformed blame entries (empty sha, non-positive line, blank file)", () => {
+    const c = commit({
+      sha: "candidate",
+      message: "refactor: cache",
+      touchedFiles: ["src/cache.ts"],
+      date: "2026-04-19T00:00:00Z",
+    });
+    const result = detectLikelyCulprit([c], {
+      affectedArea: "cache",
+      blameAttributions: [
+        { file: "src/cache.ts", line: 0, sha: "candidate" }, // bad line
+        { file: "", line: 10, sha: "candidate" }, // blank file
+        { file: "src/cache.ts", line: 10, sha: "" }, // blank sha
+      ],
+      now: NOW,
+    });
+    // Every attribution was garbage → no blame credit awarded.
+    expect(
+      result.culprit?.reasons.every((r) => !r.startsWith("blame on "))
+    ).toBe(true);
+  });
+
+  it("blame signal survives contradiction penalty but confidence caps at medium", () => {
+    // Phase 2.8 contract: when ANY negative penalty fires, confidence
+    // is capped at "medium" regardless of raw score. Blame is
+    // additive, not an override, so a heavily-penalised blame match
+    // still surfaces — just with visible "but ..." caveats and
+    // "Possible culprit" phrasing downstream.
+    const androidCommit = commit({
+      sha: "blamed-android",
+      message: "fix: checkout",
+      touchedFiles: ["android/app/src/main/java/Checkout.kt"],
+      date: "2026-04-19T00:00:00Z",
+    });
+    const result = detectLikelyCulprit([androidCommit], {
+      affectedArea: "checkout",
+      contradictions: ["Only reproduces on iOS"],
+      blameAttributions: [
+        {
+          file: "android/app/src/main/java/Checkout.kt",
+          line: 42,
+          sha: "blamed-android",
+        },
+      ],
+      now: NOW,
+    });
+    expect(result.culprit?.sha).toBe("blamed-android");
+    // Penalised → medium cap.
+    expect(result.culprit?.confidence).toBe("medium");
+    // Both signals co-present in reasons so the receiver sees the
+    // tension directly in the chip.
+    expect(
+      result.culprit?.reasons.some((r) => r.startsWith("blame on "))
+    ).toBe(true);
+    expect(
+      result.culprit?.reasons.some((r) => r.startsWith("but "))
+    ).toBe(true);
+  });
+
+  it("empty or undefined blameAttributions is a no-op (backwards compat)", () => {
+    // Phase <2.10 callers that omit blameAttributions entirely must
+    // see identical scoring behaviour. This test pins the contract.
+    const c = commit({
+      sha: "x",
+      message: "fix: checkout",
+      touchedFiles: ["src/checkout.ts"],
+      date: "2026-04-19T00:00:00Z",
+    });
+    const common = {
+      affectedArea: "checkout",
+      resolvedFiles: ["src/checkout.ts"],
+      now: NOW,
+    };
+    const without = detectLikelyCulprit([c], common);
+    const withEmpty = detectLikelyCulprit([c], {
+      ...common,
+      blameAttributions: [],
+    });
+    expect(without.topScore).toBe(withEmpty.topScore);
+    expect(without.culprit?.sha).toBe(withEmpty.culprit?.sha);
+  });
+});
