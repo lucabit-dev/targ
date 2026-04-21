@@ -735,6 +735,94 @@ describe("phase 2.7 — likely-culprit rendering", () => {
   });
 });
 
+describe("phase 2.8 — negative-evidence rendering", () => {
+  function buildPenalizedPacket(
+    reasons: string[] = [
+      'matches affected area: "checkout flow"',
+      "touched 1 of 1 suspected file",
+      "merged 1 day ago",
+      "but all touched files are tests",
+    ]
+  ) {
+    const sha = "penalizedsha0000";
+    return buildHandoffPacket({
+      ...CONTRADICTION_FIXTURE_INPUT,
+      repoEnrichment: {
+        repoFullName: "acme/checkout",
+        ref: "deadbeef0000000000000000000000000000cafe",
+        suspectedRegressions: [
+          {
+            sha,
+            message: "fix: checkout flow retry tests",
+            author: "alice",
+            date: new Date(Date.now() - 86_400_000).toISOString(),
+            prNumber: 842,
+            url: `https://github.com/acme/checkout/commit/${sha}`,
+            touchedFiles: ["src/checkout.test.ts"],
+          },
+        ],
+        likelyCulprit: {
+          sha,
+          // Negative signal fired → scoring capped confidence at medium.
+          confidence: "medium",
+          reasons,
+        },
+      },
+    });
+  }
+
+  it("surfaces the negative reason in the chip even when 3 positive reasons exist", () => {
+    // With four reasons and a 3-slot slice, a naive renderer would drop
+    // the negative ("but all touched files are tests") bullet. The
+    // renderer must prioritise negatives so the demotion rationale is
+    // never hidden.
+    const markdown = renderPacketMarkdown(buildPenalizedPacket());
+    expect(markdown).toContain("but all touched files are tests");
+  });
+
+  it("uses 'Possible culprit' wording for penalised picks (never 'Likely')", () => {
+    const markdown = renderPacketMarkdown(buildPenalizedPacket());
+    expect(markdown).toMatch(/\*\*Possible culprit:\*\*/);
+    expect(markdown).not.toMatch(/\*\*Likely culprit:\*\*/);
+  });
+
+  it("orders negative reasons before positives in the chip rationale", () => {
+    const markdown = renderPacketMarkdown(
+      buildPenalizedPacket([
+        // Intentionally shuffled: scorer emits negatives last but the
+        // renderer should re-order them to the front.
+        'matches affected area: "checkout flow"',
+        "touched 1 of 1 suspected file",
+        "merged 1 day ago",
+        "but contradicts scope: files are android-only",
+      ])
+    );
+    // The rationale section is italicised and parenthesised at the end
+    // of the chip line: `_(...)_`. Pull it out and verify the first
+    // reason in the list is the negative one.
+    const match = markdown.match(/_\(([^)]+)\)_/);
+    expect(match).not.toBeNull();
+    const rationaleFirst = match?.[1]?.split(" · ")[0] ?? "";
+    expect(rationaleFirst.startsWith("but ")).toBe(true);
+  });
+
+  it("handles multiple negative reasons without losing positives entirely", () => {
+    // When there are 2 negatives and 2 positives, with slice(0, 3):
+    // negatives first → 2 negatives + 1 positive rendered.
+    const markdown = renderPacketMarkdown(
+      buildPenalizedPacket([
+        'matches affected area: "checkout flow"',
+        "touched 1 of 1 suspected file",
+        "but all touched files are tests",
+        "but contradicts scope: files are android-only",
+      ])
+    );
+    expect(markdown).toContain("but all touched files are tests");
+    expect(markdown).toContain("but contradicts scope");
+    expect(markdown).toContain("matches affected area");
+  });
+});
+
 describe("phase 2.7 — invariants", () => {
   function packetWithCulprit(
     culpritOverrides: Record<string, unknown> = {}

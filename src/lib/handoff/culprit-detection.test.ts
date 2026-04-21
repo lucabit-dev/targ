@@ -15,8 +15,13 @@ import { describe, expect, it } from "vitest";
 import type { CommitRef, RepoEnrichmentInput } from "@/lib/handoff/packet";
 
 import {
+  classifyCommitKind,
+  classifyCommitScopes,
+  classifyFileScopes,
   detectLikelyCulprit,
   detectLikelyCulpritFromEnrichment,
+  extractContradictionScopes,
+  inferDiagnosisScopes,
   tokenize,
 } from "./culprit-detection";
 
@@ -438,5 +443,418 @@ describe("detectLikelyCulpritFromEnrichment", () => {
         expect.stringContaining("touched 1 of 1 suspected file"),
       ])
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 2.8 — scope classification
+// ---------------------------------------------------------------------------
+
+describe("classifyFileScopes", () => {
+  it("tags spec/test files as test", () => {
+    expect(classifyFileScopes("src/foo.test.ts")).toContain("test");
+    expect(classifyFileScopes("src/foo.spec.tsx")).toContain("test");
+    expect(classifyFileScopes("src/__tests__/foo.ts")).toContain("test");
+    expect(classifyFileScopes("tests/checkout.ts")).toContain("test");
+    expect(classifyFileScopes("e2e/login.ts")).toContain("test");
+    expect(classifyFileScopes("cypress/integration/x.ts")).toContain("test");
+    expect(classifyFileScopes("src/Button.stories.tsx")).toContain("test");
+  });
+
+  it("does not misclassify a source file with 'test' in its name as test-only", () => {
+    expect(classifyFileScopes("src/tester.ts")).not.toContain("test");
+    expect(classifyFileScopes("src/testing-utils.ts")).not.toContain("test");
+  });
+
+  it("tags markdown / docs folders as docs", () => {
+    expect(classifyFileScopes("README.md")).toContain("docs");
+    expect(classifyFileScopes("docs/guide.mdx")).toContain("docs");
+    expect(classifyFileScopes("CHANGELOG.md")).toContain("docs");
+    expect(classifyFileScopes("CONTRIBUTING")).toContain("docs");
+  });
+
+  it("tags lockfiles, CI config, and tool configs as config", () => {
+    expect(classifyFileScopes("package-lock.json")).toContain("config");
+    expect(classifyFileScopes("yarn.lock")).toContain("config");
+    expect(classifyFileScopes(".github/workflows/test.yml")).toContain("config");
+    expect(classifyFileScopes(".eslintrc.json")).toContain("config");
+    expect(classifyFileScopes("Dockerfile")).toContain("config");
+    expect(classifyFileScopes(".gitignore")).toContain("config");
+  });
+
+  it("does NOT tag application package.json as config", () => {
+    // package.json often holds real behaviour (deps, scripts) so a
+    // change there isn't dismissible. package-lock.json is different.
+    expect(classifyFileScopes("package.json")).not.toContain("config");
+  });
+
+  it("tags ios / android paths and platform-specific file types", () => {
+    expect(classifyFileScopes("ios/Runner/AppDelegate.swift")).toContain("ios");
+    expect(classifyFileScopes("src/App.swift")).toContain("ios");
+    expect(classifyFileScopes("android/app/src/main/MainActivity.kt")).toContain("android");
+    expect(classifyFileScopes("src/App.kt")).toContain("android");
+  });
+
+  it("tags frontend/backend via typical folder + filetype shapes", () => {
+    expect(classifyFileScopes("src/components/Button.tsx")).toContain("frontend");
+    expect(classifyFileScopes("src/styles/app.css")).toContain("frontend");
+    expect(classifyFileScopes("server/routes/users.ts")).toContain("backend");
+    expect(classifyFileScopes("api/v1/handler.py")).toContain("backend");
+  });
+});
+
+describe("classifyCommitKind", () => {
+  it("returns 'test' when all touched files are tests", () => {
+    expect(
+      classifyCommitKind([
+        "src/foo.test.ts",
+        "tests/checkout.spec.ts",
+        "e2e/login.ts",
+      ])
+    ).toBe("test");
+  });
+
+  it("returns 'docs' when all touched files are docs", () => {
+    expect(
+      classifyCommitKind(["README.md", "docs/guide.mdx", "CHANGELOG.md"])
+    ).toBe("docs");
+  });
+
+  it("returns 'config' when all touched files are tool/CI config", () => {
+    expect(
+      classifyCommitKind([
+        "package-lock.json",
+        ".github/workflows/ci.yml",
+        ".eslintrc.json",
+      ])
+    ).toBe("config");
+  });
+
+  it("returns null for a mixed test + docs commit", () => {
+    expect(
+      classifyCommitKind(["src/foo.test.ts", "README.md"])
+    ).toBeNull();
+  });
+
+  it("returns null when any file escapes the kind classification", () => {
+    expect(
+      classifyCommitKind(["src/foo.test.ts", "src/checkout.ts"])
+    ).toBeNull();
+  });
+
+  it("returns null for the empty commit (defense — shouldn't happen, but)", () => {
+    expect(classifyCommitKind([])).toBeNull();
+  });
+});
+
+describe("classifyCommitScopes", () => {
+  it("unions scopes from every touched file", () => {
+    const scopes = classifyCommitScopes([
+      "src/components/Button.tsx",
+      "server/routes/users.ts",
+    ]);
+    expect(scopes.has("frontend")).toBe(true);
+    expect(scopes.has("backend")).toBe(true);
+  });
+
+  it("returns an empty set for files that don't match any scope", () => {
+    const scopes = classifyCommitScopes(["src/checkout.ts", "src/util.ts"]);
+    expect(scopes.size).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 2.8 — contradiction extraction
+// ---------------------------------------------------------------------------
+
+describe("extractContradictionScopes", () => {
+  it("flips 'iOS only' to exclude android", () => {
+    const out = extractContradictionScopes(["Only reproduces on iOS"]);
+    expect(out.has("android")).toBe(true);
+    expect(out.has("ios")).toBe(false);
+  });
+
+  it("flips 'frontend only' to exclude backend", () => {
+    const out = extractContradictionScopes(["Frontend only — no server-side involvement"]);
+    expect(out.has("backend")).toBe(true);
+    expect(out.has("frontend")).toBe(false);
+  });
+
+  it("recognises '<scope> only' variants", () => {
+    const out1 = extractContradictionScopes(["iOS-only issue"]);
+    expect(out1.has("android")).toBe(true);
+    const out2 = extractContradictionScopes(["Happens backend-only"]);
+    expect(out2.has("frontend")).toBe(true);
+  });
+
+  it("excludes directly with 'not X' patterns", () => {
+    const out = extractContradictionScopes(["Not an Android issue"]);
+    expect(out.has("android")).toBe(true);
+    expect(out.has("ios")).toBe(false);
+  });
+
+  it("excludes with 'doesn't / no / never / isn't / without'", () => {
+    expect(extractContradictionScopes(["Doesn't happen on iOS"]).has("ios")).toBe(true);
+    expect(extractContradictionScopes(["No server-side involvement"]).has("backend")).toBe(true);
+    expect(extractContradictionScopes(["Never on android"]).has("android")).toBe(true);
+    expect(extractContradictionScopes(["Isn't a backend problem"]).has("backend")).toBe(true);
+  });
+
+  it("skips 'not only X' (ambiguous)", () => {
+    const out = extractContradictionScopes(["Not only on iOS — Android also affected"]);
+    expect(out.size).toBe(0);
+  });
+
+  it("merges multiple contradictions and returns the union", () => {
+    const out = extractContradictionScopes([
+      "Only on iOS",
+      "Not a backend issue",
+    ]);
+    expect(out.has("android")).toBe(true);
+    expect(out.has("backend")).toBe(true);
+  });
+
+  it("returns empty set for undefined / empty / irrelevant text", () => {
+    expect(extractContradictionScopes(undefined).size).toBe(0);
+    expect(extractContradictionScopes([]).size).toBe(0);
+    expect(
+      extractContradictionScopes([
+        "The two logs describe failures at different frames.",
+      ]).size
+    ).toBe(0);
+  });
+
+  it("ignores unknown scope vocabulary (no false exclusions)", () => {
+    const out = extractContradictionScopes([
+      "Only on Wednesdays", // not a scope we know
+    ]);
+    expect(out.size).toBe(0);
+  });
+});
+
+describe("inferDiagnosisScopes", () => {
+  it("identifies test-scoped diagnosis from common phrasings", () => {
+    expect(inferDiagnosisScopes(["the test suite is flaky"]).has("test")).toBe(true);
+    expect(inferDiagnosisScopes(["specs are failing intermittently"]).has("test")).toBe(true);
+  });
+
+  it("identifies docs/config/platform scopes", () => {
+    expect(inferDiagnosisScopes(["README is outdated"]).has("docs")).toBe(true);
+    expect(inferDiagnosisScopes(["dependency upgrade broke the build"]).has("config")).toBe(true);
+    expect(inferDiagnosisScopes(["iPhone users report the issue"]).has("ios")).toBe(true);
+    expect(inferDiagnosisScopes(["backend 500 errors"]).has("backend")).toBe(true);
+  });
+
+  it("returns empty set for unrelated / empty text", () => {
+    expect(inferDiagnosisScopes(["checkout flow crash"]).size).toBe(0);
+    expect(inferDiagnosisScopes([undefined]).size).toBe(0);
+    expect(inferDiagnosisScopes([]).size).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 2.8 — penalty application inside detectLikelyCulprit
+// ---------------------------------------------------------------------------
+
+describe("detectLikelyCulprit — negative evidence", () => {
+  it("demotes a test-only commit that would otherwise be the pick", () => {
+    // A commit that (a) matches the affected area + touched the only
+    // suspected file, but (b) consists exclusively of test files. It
+    // raw-scores high but should be capped at medium + carry a negative
+    // reason chip.
+    const testOnly = commit({
+      sha: "tests-only",
+      message: "fix: checkout retry flow tests",
+      touchedFiles: [
+        "src/checkout.test.ts",
+        "src/retry.spec.ts",
+        "tests/e2e/checkout.ts",
+      ],
+      date: "2026-04-19T00:00:00Z",
+    });
+    const result = detectLikelyCulprit([testOnly], {
+      affectedArea: "checkout retry flow",
+      resolvedFiles: ["src/checkout.test.ts"],
+      now: NOW,
+    });
+    expect(result.culprit?.sha).toBe("tests-only");
+    // Confidence capped at medium, even if raw score was high.
+    expect(result.culprit?.confidence).toBe("medium");
+    expect(result.culprit?.reasons).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("but all touched files are tests"),
+      ])
+    );
+  });
+
+  it("does NOT demote a test-only commit when the diagnosis IS about tests", () => {
+    const testOnly = commit({
+      sha: "tests-only",
+      message: "fix: checkout retry flow tests",
+      touchedFiles: ["src/checkout.test.ts", "src/retry.spec.ts"],
+      date: "2026-04-19T00:00:00Z",
+    });
+    const result = detectLikelyCulprit([testOnly], {
+      // Diagnosis is explicitly about the test suite flaking — test-only
+      // commits are legitimate candidates, not false positives.
+      affectedArea: "the checkout test suite is flaky",
+      resolvedFiles: ["src/checkout.test.ts"],
+      now: NOW,
+    });
+    expect(
+      result.culprit?.reasons.some((r) =>
+        r.includes("but all touched files are tests")
+      )
+    ).toBe(false);
+  });
+
+  it("demotes a docs-only commit", () => {
+    const docs = commit({
+      sha: "docs-only",
+      message: "docs: explain checkout retry flow",
+      touchedFiles: ["README.md", "docs/checkout.md"],
+      date: "2026-04-19T00:00:00Z",
+    });
+    const result = detectLikelyCulprit([docs], {
+      affectedArea: "checkout retry flow",
+      now: NOW,
+    });
+    expect(result.culprit?.reasons).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("but all touched files are docs"),
+      ])
+    );
+    expect(result.culprit?.confidence).toBe("medium");
+  });
+
+  it("demotes a config-only commit", () => {
+    const cfg = commit({
+      sha: "cfg-only",
+      message: "chore: bump dependency versions in checkout",
+      touchedFiles: ["package-lock.json", ".github/workflows/ci.yml"],
+      date: "2026-04-19T00:00:00Z",
+    });
+    const result = detectLikelyCulprit([cfg], {
+      affectedArea: "checkout",
+      now: NOW,
+    });
+    expect(result.culprit?.reasons).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("but all touched files are config"),
+      ])
+    );
+  });
+
+  it("does NOT demote a mixed test + code commit", () => {
+    // Real fixes often land with a matching test. Those should not be
+    // demoted — the test file alone is the red flag.
+    const mixed = commit({
+      sha: "mixed",
+      message: "fix: checkout retry race",
+      touchedFiles: ["src/checkout.ts", "src/checkout.test.ts"],
+      date: "2026-04-19T00:00:00Z",
+    });
+    const result = detectLikelyCulprit([mixed], {
+      affectedArea: "checkout retry race",
+      now: NOW,
+    });
+    expect(
+      result.culprit?.reasons.every(
+        (r) => !r.startsWith("but all touched files are")
+      )
+    ).toBe(true);
+  });
+
+  it("demotes when a contradiction says 'iOS only' and the commit is android-only", () => {
+    const androidCommit = commit({
+      sha: "android",
+      message: "fix: handle null in checkout flow",
+      touchedFiles: [
+        "android/app/src/main/java/Checkout.kt",
+        "android/app/build.gradle",
+      ],
+      date: "2026-04-19T00:00:00Z",
+    });
+    const result = detectLikelyCulprit([androidCommit], {
+      affectedArea: "checkout flow",
+      contradictions: ["Only reproduces on iOS"],
+      now: NOW,
+    });
+    expect(result.culprit?.reasons).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("but contradicts scope"),
+      ])
+    );
+    expect(result.culprit?.confidence).toBe("medium");
+  });
+
+  it("does NOT demote a commit straddling included + excluded scopes", () => {
+    // A commit that touched BOTH ios/ and android/ isn't cleanly in the
+    // excluded scope — we only penalise when every file is in the
+    // excluded set.
+    const mixedPlatform = commit({
+      sha: "mixed-plat",
+      message: "fix: checkout flow",
+      touchedFiles: [
+        "ios/Runner/Checkout.swift",
+        "android/app/src/main/Checkout.kt",
+      ],
+      date: "2026-04-19T00:00:00Z",
+    });
+    const result = detectLikelyCulprit([mixedPlatform], {
+      affectedArea: "checkout flow",
+      contradictions: ["Only on iOS"],
+      now: NOW,
+    });
+    expect(
+      result.culprit?.reasons.every(
+        (r) => !r.startsWith("but contradicts")
+      )
+    ).toBe(true);
+  });
+
+  it("promotes a clean commit over a demoted one with higher raw signal", () => {
+    // Raw scores favour the test-only commit (stronger keyword overlap).
+    // After demotion, the clean commit should win.
+    const demoted = commit({
+      sha: "demoted",
+      message: "fix: checkout retry flow race tests tests tests",
+      touchedFiles: [
+        "src/checkout.test.ts",
+        "src/retry.spec.ts",
+        "tests/e2e/checkout.ts",
+      ],
+      date: "2026-04-19T00:00:00Z",
+    });
+    const clean = commit({
+      sha: "clean",
+      message: "fix: checkout retry",
+      touchedFiles: ["src/checkout.ts"],
+      date: "2026-04-19T00:00:00Z",
+    });
+    const result = detectLikelyCulprit([demoted, clean], {
+      affectedArea: "checkout retry flow",
+      resolvedFiles: ["src/checkout.ts"],
+      now: NOW,
+    });
+    expect(result.culprit?.sha).toBe("clean");
+  });
+
+  it("caps high confidence at medium when the picked commit is penalised", () => {
+    // Strong raw signal: area match + root cause + 1/1 file hit +
+    // recency → normally enough for "high". But the commit is docs-only.
+    const docs = commit({
+      sha: "docs",
+      message: "docs: document checkout retry race condition",
+      touchedFiles: ["docs/checkout.md"],
+      date: "2026-04-19T00:00:00Z",
+    });
+    const result = detectLikelyCulprit([docs], {
+      affectedArea: "checkout retry race",
+      probableRootCause: "race condition in checkout",
+      resolvedFiles: ["docs/checkout.md"],
+      now: NOW,
+    });
+    expect(result.culprit?.confidence).toBe("medium");
   });
 });

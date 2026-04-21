@@ -127,7 +127,17 @@ function formatLikelyCulpritChip(packet: HandoffPacket): string {
   // Reasons get joined with ` · ` and italicised so they read as a
   // rationale chip rather than the main statement. Trim the bullet list
   // to keep the chip a single visual line in most cases.
-  const reasons = culprit.reasons.slice(0, 3).join(" \u00b7 ");
+  //
+  // Phase 2.8: negative-evidence reasons (those starting with "but ")
+  // are the most important signal in the chip — they're the reason
+  // the culprit was demoted to "Possible". Surface them first so the
+  // .slice(0, 3) truncation can't drop them when there are 3+
+  // positive reasons. Order within each group is preserved.
+  const orderedReasons = [
+    ...culprit.reasons.filter((r) => r.startsWith("but ")),
+    ...culprit.reasons.filter((r) => !r.startsWith("but ")),
+  ];
+  const reasons = orderedReasons.slice(0, 3).join(" \u00b7 ");
 
   return wrap(
     `**${confidenceWord}:** ${linked} — "${matched.message}" \u00b7 @${matched.author} \u00b7 ${when} _(${reasons})_`

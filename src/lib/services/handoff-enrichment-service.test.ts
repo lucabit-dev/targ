@@ -726,6 +726,88 @@ describe("loadRepoEnrichmentForCase", () => {
     expect(result?.likelyCulprit).toBeUndefined();
   });
 
+  // ---------------------------------------------------------------------
+  // Phase 2.8 — negative evidence plumbed through the service
+  // ---------------------------------------------------------------------
+
+  it("passes contradictions through so scope-disjoint commits get demoted", async () => {
+    // Prime with an android file so the enrichment resolver places the
+    // evidence location there and the downstream aggregator reports the
+    // commit as having touched an android-scoped file. (Recall: the
+    // aggregator's `touchedFiles` is derived from resolved files, not
+    // from the github commit payload.)
+    caseFindUnique.mockResolvedValueOnce({
+      workspaceId: "ws-1",
+      repoLinkId: "rlink-1",
+    });
+    repoLinkFindUnique.mockResolvedValueOnce(mockRepoLink());
+    repoFileFindMany.mockResolvedValueOnce([
+      mockFile("android/app/src/main/java/Checkout.kt"),
+    ]);
+    repoSymbolFindMany.mockResolvedValueOnce([]);
+
+    githubAccountFindUnique.mockResolvedValueOnce({
+      accessTokenEnc: "encrypted-blob",
+    });
+    getBlameMock.mockResolvedValueOnce(
+      singleRangeBlame({
+        sha: "android-sha",
+        message: "fix: handle null in checkout flow",
+        authorLogin: "alice",
+      })
+    );
+    // One recent commit whose message strongly matches the affected
+    // area. Because the resolved file is android-scoped, the commit
+    // will aggregate as `touchedFiles: ["android/.../Checkout.kt"]` →
+    // `classifyCommitScopes` yields `{android}` → the "Only on iOS"
+    // contradiction excludes android → penalty fires → confidence
+    // capped at medium.
+    listCommitsMock.mockResolvedValueOnce([
+      {
+        sha: "android-sha",
+        message: "fix: handle null in checkout flow",
+        authorLogin: "alice",
+        authorName: "Alice",
+        authorEmail: null,
+        date: new Date(Date.now() - 86_400_000).toISOString(),
+        htmlUrl: "https://github.com/acme/checkout/commit/android-sha",
+      },
+    ]);
+
+    // Point the evidence stack frame at the android file so the
+    // resolver places the location there deterministically.
+    const input = sampleInput();
+    input.evidence = [
+      evidenceVM({
+        extracted: {
+          stackFrames: [
+            "at foo (android/app/src/main/java/Checkout.kt:42:3)",
+          ],
+        },
+      }),
+    ];
+    input.diagnosis = diagnosisVM({
+      affectedArea: "checkout flow null handler",
+      probableRootCause: "missing null guard in checkout",
+      contradictions: ["Only reproduces on iOS — Android users unaffected"],
+    });
+
+    const result = await loadRepoEnrichmentForCase({
+      userId: "u1",
+      caseId: "case-1",
+      input,
+    });
+
+    expect(result?.likelyCulprit).toBeDefined();
+    expect(result?.likelyCulprit?.sha).toBe("android-sha");
+    expect(result?.likelyCulprit?.confidence).toBe("medium");
+    expect(
+      result?.likelyCulprit?.reasons.some((r) =>
+        r.startsWith("but contradicts scope")
+      )
+    ).toBe(true);
+  });
+
   it("falls back to file-level blame when the line is outside all ranges", async () => {
     primeEnrichedCase();
     githubAccountFindUnique.mockResolvedValueOnce({

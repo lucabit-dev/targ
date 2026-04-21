@@ -122,6 +122,28 @@ const STOPWORDS = new Set([
 const RECENT_MERGE_WINDOW_DAYS = 7;
 
 // ---------------------------------------------------------------------------
+// Phase 2.8 — negative evidence tunables
+// ---------------------------------------------------------------------------
+
+/// Penalty applied when a commit's *every* touched file is in a scope the
+/// diagnosis clearly isn't about (e.g. every file is a test, but the
+/// symptoms are in production code). Large enough to strip a commit out
+/// of medium confidence, small enough that a strong positive-signal match
+/// can still carry it over the bar.
+const P_KIND_ONLY = 3;
+
+/// Penalty applied when a contradiction contains an exclusivity marker
+/// (e.g. "iOS only", "not Android") and every file in the commit falls
+/// inside the excluded scope. Smaller than `P_KIND_ONLY` because
+/// contradiction phrasing is noisier than path classification.
+const P_CONTRADICTS_SCOPE = 2;
+
+/// Any negative signal caps the culprit at `medium` confidence — a
+/// demoted commit must never render with a "Likely culprit" label,
+/// regardless of how high the raw positive score was.
+const NEGATIVE_SIGNAL_CONFIDENCE_CAP: LikelyCulprit["confidence"] = "medium";
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -141,6 +163,11 @@ export type CulpritSignals = {
   /// suspected files" — independent from the regression's own
   /// `touchedFiles` (which is the commit's view).
   resolvedFiles?: string[];
+  /// Phase 2.8. Free-text contradictions from the LLM diagnosis. We scan
+  /// these for exclusivity markers ("only on iOS", "not Android") to
+  /// demote commits whose scope disagrees with the evidence. Empty array
+  /// or `undefined` → no contradiction penalties applied.
+  contradictions?: string[];
   /// Clock override for the recency signal. Defaults to `new Date()`.
   now?: Date;
 };
@@ -177,6 +204,15 @@ export function detectLikelyCulprit(
   const summaryTokens = tokenize(signals.summary);
   const resolvedFiles = signals.resolvedFiles ?? [];
   const now = signals.now ?? new Date();
+  const excludedScopes = extractContradictionScopes(signals.contradictions);
+  // The diagnosis tokens tell us which kinds of files are legitimately
+  // in-scope. If the affected area IS about tests, then test-only commits
+  // shouldn't be demoted. Same for docs / config / platform scopes.
+  const diagnosisScopes = inferDiagnosisScopes([
+    signals.affectedArea,
+    signals.probableRootCause,
+    signals.summary,
+  ]);
 
   const scored = regressions.map((commit) =>
     scoreCommit(commit, {
@@ -186,6 +222,8 @@ export function detectLikelyCulprit(
       areaText: signals.affectedArea,
       causeText: signals.probableRootCause,
       resolvedFiles,
+      excludedScopes,
+      diagnosisScopes,
       now,
     })
   );
@@ -204,7 +242,11 @@ export function detectLikelyCulprit(
   const runnerUp = scored[1];
   const gap = runnerUp ? top.score - runnerUp.score : Infinity;
 
-  if (top.score < MIN_SCORE_MEDIUM) {
+  // Threshold check uses `rawScore` (positives only) so a commit with
+  // strong positive signal still surfaces when heavily penalised — but
+  // it lands in the chip as "Possible culprit" with a negative reason
+  // bullet rather than silently disappearing.
+  if (top.rawScore < MIN_SCORE_MEDIUM) {
     return {
       culprit: null,
       topScore: top.score,
@@ -212,8 +254,18 @@ export function detectLikelyCulprit(
     };
   }
 
-  const confidence: LikelyCulprit["confidence"] =
+  // Confidence starts from the raw score + gap, then is capped whenever
+  // any negative signal fired on the picked commit. This means a
+  // strongly-scoring commit whose every file is a test can still be
+  // returned as the culprit (the LLM may still want to look at it), but
+  // the chip will carry "Possible culprit" wording instead of "Likely",
+  // and the rationale will include the negative reason so the receiver
+  // can audit the demotion.
+  const rawConfidence: LikelyCulprit["confidence"] =
     top.score >= MIN_SCORE_HIGH && gap >= MIN_GAP_HIGH ? "high" : "medium";
+  const confidence: LikelyCulprit["confidence"] = top.penalized
+    ? NEGATIVE_SIGNAL_CONFIDENCE_CAP
+    : rawConfidence;
 
   return {
     culprit: {
@@ -257,13 +309,34 @@ type ScoreContext = {
   areaText: string | undefined;
   causeText: string | undefined;
   resolvedFiles: string[];
+  /// Phase 2.8. Scopes called out as "only on X" / "not X" in the
+  /// contradictions. A commit whose files all live in an excluded scope
+  /// gets demoted.
+  excludedScopes: Set<Scope>;
+  /// Phase 2.8. Scopes that the diagnosis IS about (e.g. "the test suite
+  /// is flaky" → `{test}`). When a commit's scope matches one of these,
+  /// we suppress the kind-only penalty — it's not a false positive, it's
+  /// the right kind of commit to suspect.
+  diagnosisScopes: Set<Scope>;
   now: Date;
 };
 
 type ScoredCommit = {
   commit: CommitRef;
+  /// Positive signals only — used as the "is this commit worth
+  /// surfacing at all?" threshold check. A commit with strong raw
+  /// signal but heavy penalty (e.g. "fix: checkout retry" in
+  /// docs/checkout.md) still surfaces, just with "Possible culprit"
+  /// wording + the negative reason chip.
+  rawScore: number;
+  /// Post-penalty score — used for ranking (so clean commits beat
+  /// penalised ones with similar raw signal) and for confidence
+  /// banding.
   score: number;
   reasons: string[];
+  /// Phase 2.8. `true` when any negative-evidence penalty fired. Caps
+  /// the confidence band at `medium` regardless of raw score.
+  penalized: boolean;
 };
 
 /// Score weights — tuned conservatively. Increase only with evidence from
@@ -278,15 +351,27 @@ const W_RECENT_MERGE = 0.5;
 function scoreCommit(commit: CommitRef, ctx: ScoreContext): ScoredCommit {
   const reasons: string[] = [];
   let score = 0;
+  // `rawScore` accumulates ONLY the positive signals so we can use it as
+  // the surface-worthiness threshold. `score` is raw minus any negative
+  // penalties and drives ranking + confidence.
+  let rawScore = 0;
 
   const messageTokens = tokenize(commit.message);
+
+  // Local helper: every positive credit goes through here so rawScore
+  // and score stay in lockstep for positives. Penalties are applied to
+  // `score` only, below.
+  const credit = (amount: number) => {
+    score += amount;
+    rawScore += amount;
+  };
 
   // Affected-area match — strongest signal.
   const areaOverlap = intersectSize(messageTokens, ctx.areaTokens);
   if (areaOverlap > 0) {
-    score += W_AREA_HIT;
+    credit(W_AREA_HIT);
     if (areaOverlap > 1) {
-      score += W_AREA_OVERLAP * Math.min(areaOverlap - 1, 3);
+      credit(W_AREA_OVERLAP * Math.min(areaOverlap - 1, 3));
     }
     if (ctx.areaText) {
       // Keep the reason short — the chip is one line in the rendered
@@ -305,7 +390,7 @@ function scoreCommit(commit: CommitRef, ctx: ScoreContext): ScoredCommit {
   const causeOnly = differenceWith(ctx.causeTokens, ctx.areaTokens);
   const causeOverlap = intersectSize(messageTokens, causeOnly);
   if (causeOverlap > 0) {
-    score += W_CAUSE_HIT;
+    credit(W_CAUSE_HIT);
     if (ctx.causeText) {
       reasons.push(
         `matches probable root cause: "${truncate(ctx.causeText, 40)}"`
@@ -324,7 +409,7 @@ function scoreCommit(commit: CommitRef, ctx: ScoreContext): ScoredCommit {
   );
   const summaryOverlap = intersectSize(messageTokens, summaryOnly);
   if (summaryOverlap > 0) {
-    score += W_SUMMARY_HIT;
+    credit(W_SUMMARY_HIT);
   }
 
   // File-hit ratio — how many of the resolved files this commit touched.
@@ -337,7 +422,7 @@ function scoreCommit(commit: CommitRef, ctx: ScoreContext): ScoredCommit {
     ).length;
     if (overlap > 0) {
       const ratio = overlap / ctx.resolvedFiles.length;
-      score += W_FILE_HIT_RATIO * ratio;
+      credit(W_FILE_HIT_RATIO * ratio);
       reasons.push(
         `touched ${overlap} of ${ctx.resolvedFiles.length} suspected file${ctx.resolvedFiles.length === 1 ? "" : "s"}`
       );
@@ -352,12 +437,56 @@ function scoreCommit(commit: CommitRef, ctx: ScoreContext): ScoredCommit {
   if (Number.isFinite(ts)) {
     const ageDays = (ctx.now.getTime() - ts) / 86_400_000;
     if (ageDays >= 0 && ageDays <= RECENT_MERGE_WINDOW_DAYS) {
-      score += W_RECENT_MERGE;
+      credit(W_RECENT_MERGE);
       reasons.push(formatRelativeAge(ageDays));
     }
   }
 
-  return { commit, score, reasons };
+  // Phase 2.8 — negative-evidence penalties. Applied AFTER positive
+  // signals so the raw score is still a meaningful observability signal
+  // (we log it). Penalty reasons are prefixed with "but " so the rendered
+  // chip reads as "touched 2/3 files · but all touched files are tests".
+  let penalized = false;
+
+  // Penalty 1 — kind-only commit (test-only / docs-only / config-only)
+  // when the diagnosis isn't about that kind. `classifyCommitKind`
+  // returns the exclusive kind ("test" | "docs" | "config") only when
+  // ALL touched files fall in it; mixed commits are safe from this
+  // penalty.
+  const commitKind = classifyCommitKind(commit.touchedFiles);
+  if (commitKind && !ctx.diagnosisScopes.has(commitKind)) {
+    score -= P_KIND_ONLY;
+    penalized = true;
+    reasons.push(
+      `but all touched files are ${commitKind === "test" ? "tests" : commitKind}`
+    );
+  }
+
+  // Penalty 2 — commit's scope disjoint from the diagnosis. When a
+  // contradiction says "iOS only" and the commit touched only Android
+  // files, demote.
+  if (ctx.excludedScopes.size > 0) {
+    const commitScopes = classifyCommitScopes(commit.touchedFiles);
+    if (commitScopes.size > 0) {
+      // Every scope the commit falls in is excluded → full scope
+      // disagreement. A commit that straddles included + excluded scopes
+      // is safe from this penalty; we only fire when there's nothing
+      // "inside" the evidence scope.
+      const allExcluded = [...commitScopes].every((s) =>
+        ctx.excludedScopes.has(s)
+      );
+      if (allExcluded) {
+        score -= P_CONTRADICTS_SCOPE;
+        penalized = true;
+        const scopeList = [...commitScopes].join("/");
+        reasons.push(
+          `but contradicts scope: files are ${scopeList}-only`
+        );
+      }
+    }
+  }
+
+  return { commit, rawScore, score, reasons, penalized };
 }
 
 // ---------------------------------------------------------------------------
@@ -424,4 +553,300 @@ function formatRelativeAge(ageDays: number): string {
   if (ageDays < 1) return "merged today";
   if (ageDays < 2) return "merged yesterday";
   return `merged ${Math.round(ageDays)} days ago`;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2.8 — scope classification + contradiction extraction
+// ---------------------------------------------------------------------------
+
+/// Scope tags a file can live in. Kept deliberately small — we only
+/// include scopes where misclassification is low and the penalty
+/// signal is strong. Adding more (e.g. `schema`, `migration`) without
+/// matching LLM vocabulary would just produce noise.
+export type Scope =
+  | "test"
+  | "docs"
+  | "config"
+  | "ios"
+  | "android"
+  | "frontend"
+  | "backend";
+
+/// Exclusive "kind" of a commit — the subset of `Scope` we use for the
+/// kind-only penalty. Only returned when ALL touched files fall in the
+/// same kind; mixed-kind commits are undefined (safe).
+type CommitKind = Extract<Scope, "test" | "docs" | "config">;
+
+/// Classifies a single file path into zero-or-more scopes. Returns the
+/// full set so a file can be tagged as, say, `ios + frontend`.
+///
+/// Patterns are deliberately conservative. A few rules of thumb:
+///   - Test patterns require explicit test-folder/file shape.
+///   - Docs patterns include `.md`/`.mdx` but exclude `*.test.md` etc.
+///   - Config patterns cover only top-level tooling (lockfiles, CI,
+///     formatter configs) — not application config (which usually
+///     reflects real behaviour).
+export function classifyFileScopes(path: string): Set<Scope> {
+  const out = new Set<Scope>();
+  const normalized = path.replace(/\\/g, "/").toLowerCase();
+  const base = normalized.split("/").pop() ?? "";
+
+  // --- test ---
+  if (
+    /\.(test|spec)\.[cm]?[jt]sx?$/.test(normalized) ||
+    /(^|\/)__tests__\//.test(normalized) ||
+    /(^|\/)tests?\//.test(normalized) ||
+    /(^|\/)e2e\//.test(normalized) ||
+    /(^|\/)cypress\//.test(normalized) ||
+    /(^|\/)playwright\//.test(normalized) ||
+    /\.stories\.[jt]sx?$/.test(normalized)
+  ) {
+    out.add("test");
+  }
+
+  // --- docs ---
+  if (
+    /\.(md|mdx|rst|adoc|txt)$/.test(normalized) ||
+    /(^|\/)docs?\//.test(normalized) ||
+    base === "readme" ||
+    base.startsWith("readme.") ||
+    base === "changelog" ||
+    base.startsWith("changelog.") ||
+    base === "contributing" ||
+    base.startsWith("contributing.")
+  ) {
+    out.add("docs");
+  }
+
+  // --- config (build/tooling only — not application config) ---
+  if (
+    base === "package-lock.json" ||
+    base === "yarn.lock" ||
+    base === "pnpm-lock.yaml" ||
+    base === "bun.lockb" ||
+    base === "gemfile.lock" ||
+    base === "cargo.lock" ||
+    base === "poetry.lock" ||
+    base === ".gitignore" ||
+    base === ".dockerignore" ||
+    base === ".prettierrc" ||
+    base.startsWith(".prettierrc.") ||
+    base === ".prettierignore" ||
+    base.startsWith(".eslintrc") ||
+    base === ".editorconfig" ||
+    base === "dockerfile" ||
+    base.endsWith(".dockerfile") ||
+    /(^|\/)\.github\//.test(normalized) ||
+    /(^|\/)\.circleci\//.test(normalized) ||
+    /(^|\/)\.husky\//.test(normalized) ||
+    base === "renovate.json" ||
+    base === "dependabot.yml"
+  ) {
+    out.add("config");
+  }
+
+  // --- platform: ios / android ---
+  if (
+    /(^|\/)ios\//.test(normalized) ||
+    /\.(swift|m|mm)$/.test(normalized) ||
+    /\.xcodeproj\//.test(normalized) ||
+    base.endsWith(".xcconfig")
+  ) {
+    out.add("ios");
+  }
+  if (
+    /(^|\/)android\//.test(normalized) ||
+    /\.(kt|kts)$/.test(normalized) ||
+    base === "androidmanifest.xml" ||
+    /(^|\/)gradle\//.test(normalized)
+  ) {
+    out.add("android");
+  }
+
+  // --- frontend / backend (high-confidence shapes only) ---
+  if (
+    /\.(tsx|jsx|vue|svelte)$/.test(normalized) ||
+    /\.(css|scss|sass|less)$/.test(normalized) ||
+    /(^|\/)(components?|pages?|views?|ui|client|web|frontend)\//.test(
+      normalized
+    )
+  ) {
+    out.add("frontend");
+  }
+  if (
+    /(^|\/)(server|backend|api|workers?|services?|jobs?|routes?)\//.test(
+      normalized
+    ) ||
+    /\.(rb|py|go|rs|java|cs|ex|exs)$/.test(normalized)
+  ) {
+    out.add("backend");
+  }
+
+  return out;
+}
+
+/// Union of file scopes across every touched file, for the contradiction
+/// penalty. A commit gets tagged with every scope any of its files hits.
+export function classifyCommitScopes(touchedFiles: string[]): Set<Scope> {
+  const out = new Set<Scope>();
+  for (const f of touchedFiles) {
+    for (const s of classifyFileScopes(f)) {
+      out.add(s);
+    }
+  }
+  return out;
+}
+
+/// Returns the exclusive kind of a commit when EVERY touched file falls
+/// in the same `test`/`docs`/`config` bucket. Returns `null` for mixed
+/// commits (safe: no penalty) or for commits whose files don't cleanly
+/// classify. Intentionally stricter than `classifyCommitScopes` — a
+/// single mixed-kind file protects the commit from the `P_KIND_ONLY`
+/// penalty.
+export function classifyCommitKind(
+  touchedFiles: string[]
+): CommitKind | null {
+  if (touchedFiles.length === 0) return null;
+  const kinds = new Set<CommitKind>();
+  for (const file of touchedFiles) {
+    const scopes = classifyFileScopes(file);
+    // Does this file qualify as test / docs / config?
+    let kind: CommitKind | null = null;
+    if (scopes.has("test")) kind = "test";
+    else if (scopes.has("docs")) kind = "docs";
+    else if (scopes.has("config")) kind = "config";
+    if (!kind) return null; // Any non-kind file breaks exclusivity.
+    kinds.add(kind);
+  }
+  // All files must share ONE kind. ["test", "docs"] mix → null.
+  return kinds.size === 1 ? [...kinds][0]! : null;
+}
+
+/// Extracts scope tokens from the diagnosis's "positive space" fields
+/// (affectedArea, probableRootCause, summary). When the diagnosis IS
+/// about tests or docs, we suppress the `P_KIND_ONLY` penalty for
+/// commits of that kind — otherwise a legitimately-suspected
+/// test-updating commit would get wrongly demoted.
+export function inferDiagnosisScopes(texts: (string | undefined)[]): Set<Scope> {
+  const out = new Set<Scope>();
+  const joined = texts
+    .filter((t): t is string => typeof t === "string")
+    .join(" ")
+    .toLowerCase();
+  if (joined.length === 0) return out;
+  // Word-boundary matches so we don't pick up "testing" for "test"
+  // scope (too generic). Use specific plural / noun forms only.
+  if (/\b(tests?|test suite|spec|specs|flak(y|e|iness))\b/.test(joined)) {
+    out.add("test");
+  }
+  if (/\b(docs?|documentation|readme|changelog)\b/.test(joined)) {
+    out.add("docs");
+  }
+  if (
+    /\b(lockfile|lock file|dependency|dependencies|package\.json|ci(?:\/cd)?|pipeline|build config)\b/.test(
+      joined
+    )
+  ) {
+    out.add("config");
+  }
+  if (/\b(ios|iphone|ipad|safari mobile)\b/.test(joined)) out.add("ios");
+  if (/\b(android|kotlin)\b/.test(joined)) out.add("android");
+  if (/\b(frontend|front-end|client-side|ui|browser)\b/.test(joined)) {
+    out.add("frontend");
+  }
+  if (
+    /\b(backend|back-end|server-side|server|api|worker)\b/.test(joined)
+  ) {
+    out.add("backend");
+  }
+  return out;
+}
+
+/// Scans free-text contradictions for exclusivity patterns ("only on
+/// iOS", "not Android", "server-side only") and returns the set of
+/// scopes the diagnosis is saying the bug ISN'T in.
+///
+/// Patterns recognised (case-insensitive):
+///   - "only on <scope>" / "only in <scope>" / "only <scope>"
+///   - "<scope> only" / "<scope>-only"
+///   - "not on <scope>" / "not in <scope>" / "not <scope>"
+///   - "doesn't / does not / no / never ... <scope>"
+///
+/// Ambiguity handling:
+///   - "X only" → the bug is in X, so NOT-X is excluded. We flip using
+///     a small known pairing (ios↔android, frontend↔backend). Unknown
+///     flips are ignored — we'd rather miss a penalty than apply a
+///     wrong one.
+///   - "not X" → X is excluded directly.
+///   - Double negatives and "not only X" are skipped for safety.
+export function extractContradictionScopes(
+  contradictions: string[] | undefined
+): Set<Scope> {
+  const out = new Set<Scope>();
+  if (!contradictions || contradictions.length === 0) return out;
+
+  const OPPOSITE: Partial<Record<Scope, Scope[]>> = {
+    ios: ["android"],
+    android: ["ios"],
+    frontend: ["backend"],
+    backend: ["frontend"],
+  };
+
+  const SCOPE_VOCAB: { words: string[]; scope: Scope }[] = [
+    { words: ["ios", "iphone", "ipad"], scope: "ios" },
+    { words: ["android"], scope: "android" },
+    {
+      words: ["frontend", "front-end", "client-side", "ui", "browser"],
+      scope: "frontend",
+    },
+    {
+      words: ["backend", "back-end", "server-side", "server", "api"],
+      scope: "backend",
+    },
+  ];
+
+  for (const raw of contradictions) {
+    if (typeof raw !== "string") continue;
+    const text = raw.toLowerCase();
+    // "not only X" is ambiguous — skip it entirely to avoid flipping in
+    // the wrong direction.
+    if (/\bnot\s+only\b/.test(text)) continue;
+
+    // Up to 4 intervening short tokens between the marker and the scope
+    // word so phrases like "Only reproduces on iOS" / "Doesn't happen on
+    // Android" / "Not an Android issue" all match. Bounded so we don't
+    // accidentally pair distant markers with distant scope mentions in
+    // the same sentence (that bit us in an earlier prototype).
+    const GAP = "(?:\\s+\\w+){0,4}\\s+";
+
+    for (const { words, scope } of SCOPE_VOCAB) {
+      for (const word of words) {
+        const w = escapeRegex(word);
+        // "X only" / "X-only" / "only on X" → bug IS in X → exclude opposite.
+        if (
+          new RegExp(`\\b${w}[\\s-]only\\b`).test(text) ||
+          new RegExp(`\\bonly${GAP}${w}\\b`).test(text)
+        ) {
+          for (const opp of OPPOSITE[scope] ?? []) {
+            out.add(opp);
+          }
+          continue;
+        }
+        // "not X" / "not on X" / "doesn't X" / "no X" / "isn't X" / "never X"
+        // / "without X". X is excluded directly.
+        if (
+          new RegExp(
+            `\\b(?:not|no|never|doesn'?t|does\\s+not|isn'?t|without)${GAP}${w}\\b`
+          ).test(text)
+        ) {
+          out.add(scope);
+        }
+      }
+    }
+  }
+  return out;
+}
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

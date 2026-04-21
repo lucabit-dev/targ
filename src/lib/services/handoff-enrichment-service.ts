@@ -200,6 +200,10 @@ function applyCulpritDetection(params: {
       affectedArea: input.diagnosis.affectedArea,
       probableRootCause: input.diagnosis.probableRootCause,
       summary: input.diagnosis.summary,
+      // Phase 2.8: contradictions feed the negative-evidence layer.
+      // They trigger scope-exclusion penalties ("Only on iOS" → demote
+      // android-only commits) and nudge the confidence cap to medium.
+      contradictions: input.diagnosis.contradictions,
     });
     if (process.env.NODE_ENV !== "production") {
       console.info(`${LOG_PREFIX} culprit detection`, {
