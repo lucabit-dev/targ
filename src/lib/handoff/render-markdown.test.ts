@@ -412,3 +412,180 @@ describe("target wrappers", () => {
     expect(wrapped.match(/## Instructions for the agent/g)?.length).toBe(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase 2.5 — blame + suspected regressions rendering
+//
+// These tests assert the user-visible format that packet consumers rely on.
+// We build a minimal packet input, inject Phase 2.5 enrichment data, and
+// snapshot / regex the rendered output.
+// ---------------------------------------------------------------------------
+
+describe("phase 2.5 — blame rendering", () => {
+  function buildPacketWithBlame() {
+    return buildHandoffPacket({
+      ...CONTRADICTION_FIXTURE_INPUT,
+      repoEnrichment: {
+        repoFullName: "acme/checkout",
+        ref: "deadbeef0000000000000000000000000000cafe",
+        affectedAreaLocation: {
+          file: "src/lib/checkout.ts",
+          line: 42,
+          blame: {
+            author: "alice",
+            commitSha: "abc123def456",
+            commitMessage: "fix: null check in checkout",
+            prNumber: 842,
+            date: new Date(Date.now() - 2 * 86_400_000).toISOString(),
+          },
+        },
+        stackLocations: [
+          {
+            file: "src/lib/checkout.ts",
+            line: 42,
+            blame: {
+              author: "alice",
+              commitSha: "abc123def456",
+              commitMessage: "fix: null check in checkout",
+              prNumber: 842,
+              date: new Date(Date.now() - 2 * 86_400_000).toISOString(),
+            },
+          },
+        ],
+        evidenceLocations: {
+          [apiEvidenceId]: [
+            {
+              file: "src/lib/checkout.ts",
+              line: 42,
+              blame: {
+                author: "bob",
+                commitSha: "def789abc012",
+                commitMessage: "refactor: extract helper",
+                date: new Date(Date.now() - 10 * 86_400_000).toISOString(),
+              },
+            },
+          ],
+        },
+        suspectedRegressions: [
+          {
+            sha: "abc123def456aaaa",
+            message: "fix: null check in checkout (#842)",
+            author: "alice",
+            date: new Date(Date.now() - 2 * 86_400_000).toISOString(),
+            prNumber: 842,
+            url: "https://github.com/acme/checkout/commit/abc123def456aaaa",
+            touchedFiles: ["src/lib/checkout.ts", "src/lib/payments.ts"],
+          },
+        ],
+      },
+    });
+  }
+
+  it("adds a compact blame chip to the affected-area line", () => {
+    const packet = buildPacketWithBlame();
+    const markdown = renderPacketMarkdown(packet);
+    // `_(@alice · #842 · 2 days ago)_`
+    expect(markdown).toMatch(/@alice\s+·\s+#842\s+·\s+\d+\s+days?\s+ago/);
+    // Must appear inside the Best current read section (before ## Evidence).
+    const bestReadSection = markdown
+      .split("## Evidence")[0]
+      .split("## Best current read")[1] ?? "";
+    expect(bestReadSection).toContain("@alice");
+    expect(bestReadSection).toContain("#842");
+  });
+
+  it("appends full blame to each '- In repo:' evidence bullet", () => {
+    const packet = buildPacketWithBlame();
+    const markdown = renderPacketMarkdown(packet);
+    expect(markdown).toMatch(
+      /- In repo:.*last changed in commit def789a by @bob/
+    );
+  });
+
+  it("appends full blame to each stack-location bullet in repo context", () => {
+    const packet = buildPacketWithBlame();
+    const markdown = renderPacketMarkdown(packet);
+    expect(markdown).toMatch(
+      /last changed in #842 by @alice, \d+ days? ago: "fix: null check in checkout"/
+    );
+  });
+
+  it("renders suspected regressions with linked PR, author, recency, and touched files", () => {
+    const packet = buildPacketWithBlame();
+    const markdown = renderPacketMarkdown(packet);
+    expect(markdown).toContain("- Suspected recent regressions:");
+    // Nested bullet shape:
+    //   - [#842](https://github.com/.../pull/842) · @alice · 2 days ago — "..." — touched `src/...`, `src/...`
+    expect(markdown).toMatch(
+      /\[#842\]\(https:\/\/github\.com\/acme\/checkout\/pull\/842\)\s+·\s+@alice/
+    );
+    expect(markdown).toContain("`src/lib/checkout.ts`");
+    expect(markdown).toContain("`src/lib/payments.ts`");
+  });
+
+  it("omits blame surfaces entirely when enrichment didn't attach blame", () => {
+    // Vanilla fixture has no enrichment — the output must be free of blame chips.
+    const markdown = renderPacketMarkdown(buildHandoffPacket(CONTRADICTION_FIXTURE_INPUT));
+    expect(markdown).not.toMatch(/last changed in/);
+    expect(markdown).not.toContain("Suspected recent regressions");
+  });
+});
+
+describe("phase 2.5 — invariants", () => {
+  function packetWithBlame(blameOverrides: Record<string, unknown> = {}) {
+    return buildHandoffPacket({
+      ...CONTRADICTION_FIXTURE_INPUT,
+      repoEnrichment: {
+        repoFullName: "acme/checkout",
+        ref: "deadbeef0000000000000000000000000000cafe",
+        affectedAreaLocation: {
+          file: "src/lib/checkout.ts",
+          line: 42,
+          blame: {
+            author: "alice",
+            commitSha: "abc123",
+            commitMessage: "fix",
+            date: new Date().toISOString(),
+            ...blameOverrides,
+          },
+        },
+      },
+    });
+  }
+
+  it("rejects a packet whose blame has an empty author", () => {
+    const packet = packetWithBlame({ author: "   " });
+    expect(() =>
+      assertPacketValid(packet, knownEvidenceIdsFromInput())
+    ).toThrow(/repo_location_blame_author_required/);
+  });
+
+  it("rejects a packet whose blame has a non-positive prNumber", () => {
+    const packet = packetWithBlame({ prNumber: 0 });
+    expect(() =>
+      assertPacketValid(packet, knownEvidenceIdsFromInput())
+    ).toThrow(/repo_location_blame_pr_positive/);
+  });
+
+  it("rejects a packet whose suspectedRegressions has no touched files", () => {
+    const packet = buildHandoffPacket({
+      ...CONTRADICTION_FIXTURE_INPUT,
+      repoEnrichment: {
+        repoFullName: "acme/checkout",
+        ref: "deadbeef",
+        suspectedRegressions: [
+          {
+            sha: "abc",
+            message: "x",
+            author: "alice",
+            date: new Date().toISOString(),
+            touchedFiles: [],
+          },
+        ],
+      },
+    });
+    expect(() =>
+      assertPacketValid(packet, knownEvidenceIdsFromInput())
+    ).toThrow(/suspected_regression_files_required/);
+  });
+});

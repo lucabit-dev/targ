@@ -75,11 +75,31 @@ function renderBestRead(packet: HandoffPacket): string {
   const areaLineParts = [`**Affected area:** ${area.label}`];
   if (area.repoLocation) {
     const pretty = formatRepoLocationLink(area.repoLocation, packet.repoContext);
-    if (pretty) areaLineParts.push(`→ ${pretty}`);
+    if (pretty) {
+      const chip = formatBlameChip(area.repoLocation.blame);
+      areaLineParts.push(chip ? `→ ${pretty} ${chip}` : `→ ${pretty}`);
+    }
   }
   lines.push("", wrap(areaLineParts.join(" ")));
 
   return lines.join("\n");
+}
+
+/// Compact inline blame suffix, e.g. `(@alice · #842 · 2d ago)`. Used in
+/// surfaces where a full "— last changed in X by Y, Z days ago: msg" bullet
+/// would be too verbose (e.g. the best-read affected-area line).
+function formatBlameChip(
+  blame: RepoLocation["blame"] | undefined
+): string {
+  if (!blame) return "";
+  const parts: string[] = [`@${blame.author}`];
+  if (blame.prNumber) {
+    parts.push(`#${blame.prNumber}`);
+  } else {
+    parts.push(blame.commitSha.slice(0, 7));
+  }
+  parts.push(formatRelativeDate(blame.date));
+  return `_(${parts.join(" \u00b7 ")})_`;
 }
 
 function formatRepoLocationInline(location: RepoLocation): string {
@@ -161,14 +181,15 @@ function renderEvidenceItem(
 /// Renders per-evidence `repoLocations` as a compact nested list immediately
 /// below the summary / code fence. Only emitted when the enclosing packet
 /// carries enough context to produce blob URLs — otherwise the inline form
-/// (backticked path:line) stands in.
+/// (backticked path:line) stands in. Each bullet includes blame when the
+/// enrichment layer was able to resolve it (Phase 2.5).
 function renderEvidenceLocations(
   locations: RepoLocation[] | undefined,
   repoContext: HandoffPacket["repoContext"]
 ): string {
   if (!locations || locations.length === 0) return "";
   const lines = locations.map(
-    (loc) => `   - In repo: ${formatRepoLocationLink(loc, repoContext)}`
+    (loc) => `   - In repo: ${formatRepoLocationBullet(loc, repoContext)}`
   );
   return lines.join("\n");
 }
@@ -252,13 +273,66 @@ function renderRepoContext(packet: HandoffPacket): string {
     }
   }
   if (ctx.suspectedRegressions && ctx.suspectedRegressions.length > 0) {
-    lines.push("- Suspected recent regressions touching this path:");
+    lines.push("- Suspected recent regressions:");
     for (const commit of ctx.suspectedRegressions) {
-      const pr = commit.prNumber ? `#${commit.prNumber}` : commit.sha.slice(0, 7);
-      lines.push(`  - ${pr} by @${commit.author}: "${commit.message}"`);
+      lines.push(`  - ${formatSuspectedRegressionBullet(commit, ctx)}`);
     }
   }
   return ["## Repo context", "", lines.join("\n")].join("\n");
+}
+
+/// Renders a single `CommitRef` from `repoContext.suspectedRegressions` as a
+/// nested bullet. Format:
+///   - [#842](https://github.com/owner/repo/pull/842) · @alice · 2d ago — "msg" — touched `src/a.ts`, `src/b.ts`
+///
+/// We link the PR (or commit SHA when no PR is known) so agents can follow
+/// the change trail without leaving the packet. Keeping the pieces separated
+/// by `·` avoids markdown parser ambiguity when the message itself contains
+/// punctuation.
+function formatSuspectedRegressionBullet(
+  commit: NonNullable<HandoffPacket["repoContext"]>["suspectedRegressions"] extends
+    | ReadonlyArray<infer C>
+    | undefined
+    ? C
+    : never,
+  ctx: NonNullable<HandoffPacket["repoContext"]>
+): string {
+  const label = commit.prNumber
+    ? `#${commit.prNumber}`
+    : commit.sha.slice(0, 7);
+  const ref = buildCommitRefUrl(commit, ctx);
+  const linked = ref ? `[${label}](${ref})` : label;
+  const when = formatRelativeDate(commit.date);
+  const touched = commit.touchedFiles
+    .slice(0, 4)
+    .map((file) => `\`${file}\``)
+    .join(", ");
+  const truncated =
+    commit.touchedFiles.length > 4
+      ? `, +${commit.touchedFiles.length - 4} more`
+      : "";
+  return `${linked} \u00b7 @${commit.author} \u00b7 ${when} — "${commit.message}" — touched ${touched}${truncated}`;
+}
+
+function buildCommitRefUrl(
+  commit: NonNullable<HandoffPacket["repoContext"]>["suspectedRegressions"] extends
+    | ReadonlyArray<infer C>
+    | undefined
+    ? C
+    : never,
+  ctx: NonNullable<HandoffPacket["repoContext"]>
+): string | null {
+  // Prefer the PR URL when we have one — it's the most human-readable entry
+  // point. Fall back to the commit URL we were given, then the commit SHA on
+  // the tree.
+  if (commit.prNumber && ctx.repoFullName) {
+    return `https://github.com/${ctx.repoFullName}/pull/${commit.prNumber}`;
+  }
+  if (commit.url) return commit.url;
+  if (ctx.repoFullName) {
+    return `https://github.com/${ctx.repoFullName}/commit/${commit.sha}`;
+  }
+  return null;
 }
 
 function formatRepoContextHeader(ctx: NonNullable<HandoffPacket["repoContext"]>): string {
