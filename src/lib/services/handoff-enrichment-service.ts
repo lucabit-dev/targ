@@ -24,11 +24,20 @@
 
 import type { RepoFileKind, RepoSymbolKind } from "@prisma/client";
 
+import {
+  enrichBlame,
+  type BlameCommit,
+  type BlameContext,
+} from "@/lib/handoff/blame-enrichment";
 import type { HandoffPacketInput, RepoEnrichmentInput } from "@/lib/handoff/packet";
 import {
   enrichPacketInput,
   type EnrichmentContext,
 } from "@/lib/handoff/repo-enrichment";
+import {
+  GithubApiError,
+  listCommitsForPath,
+} from "@/lib/github/client";
 import { prisma } from "@/lib/prisma";
 import {
   resolvePath,
@@ -36,10 +45,33 @@ import {
   type ResolverInputFile,
   type ResolverInputSymbol,
 } from "@/lib/repo-index/resolver";
+import { getDecryptedAccessToken } from "@/lib/services/github-account-service";
 import {
   isRepoSnapshotStale,
   syncRepoTree,
 } from "@/lib/services/repo-index-service";
+
+// ---------------------------------------------------------------------------
+// Blame enrichment tunables (Phase 2.5)
+// ---------------------------------------------------------------------------
+
+/// Cap the number of distinct files we query for blame per handoff. Keeps
+/// the GitHub cost bounded even on packets with lots of evidence locations.
+/// Files beyond the cap still ship in the packet, just without `blame`.
+const BLAME_FILE_BUDGET = 8;
+
+/// Commits per file. Enough to (a) populate the top blame and (b) give the
+/// regression ranker a few candidates to dedupe across files.
+const BLAME_COMMITS_PER_FILE = 5;
+
+/// Max concurrent GitHub calls. GitHub's authenticated budget is 5000/hour;
+/// fan-out of 3-4 per handoff is fine while still keeping tail latency low.
+const BLAME_CONCURRENCY = 3;
+
+/// Per-file fetch timeout. If a single commits call takes too long the
+/// whole handoff waits, so fail fast and let the packet ship without that
+/// file's blame.
+const BLAME_FETCH_TIMEOUT_MS = 4_000;
 
 const LOG_PREFIX = "[handoff-enrichment]";
 
@@ -112,13 +144,163 @@ export async function loadRepoEnrichmentForCase(
     resolveSymbol: (query, options) => resolveSymbol(query, symbols, options),
   };
 
+  let baseEnrichment: RepoEnrichmentInput;
   try {
-    return enrichPacketInput(params.input, ctx);
+    baseEnrichment = enrichPacketInput(params.input, ctx);
   } catch (error) {
     // Enrichment is best-effort — never let a bug here take out handoff.
     console.warn(`${LOG_PREFIX} enrichPacketInput threw`, error);
     return undefined;
   }
+
+  // Phase 2.5: layer blame + suspected regressions on top of the resolved
+  // enrichment. This hits GitHub's list-commits API per unique file, so it
+  // only runs when the user has a connected GitHub account; any failure
+  // falls back to the pre-2.5 enrichment without throwing.
+  return applyBlameEnrichment({
+    userId: params.userId,
+    repoLink,
+    baseEnrichment,
+  });
+}
+
+async function applyBlameEnrichment(params: {
+  userId: string;
+  repoLink: PickedRepoLink["repoLink"];
+  baseEnrichment: RepoEnrichmentInput;
+}): Promise<RepoEnrichmentInput> {
+  const { userId, repoLink, baseEnrichment } = params;
+
+  // Short-circuit: if no resolved locations, there's nothing to blame.
+  const hasLocations =
+    baseEnrichment.affectedAreaLocation !== undefined ||
+    (baseEnrichment.stackLocations?.length ?? 0) > 0 ||
+    Object.keys(baseEnrichment.evidenceLocations ?? {}).length > 0;
+  if (!hasLocations) return baseEnrichment;
+
+  // Token lookup can fail (user revoked access between snapshot + handoff).
+  // Treat that identically to "no connected account" — ship unenriched.
+  let token: string | null = null;
+  try {
+    token = await getDecryptedAccessToken(userId);
+  } catch (error) {
+    console.warn(`${LOG_PREFIX} token lookup failed`, error);
+  }
+  if (!token) return baseEnrichment;
+
+  const ctx = buildBlameContext({ token, repoLink });
+
+  try {
+    const result = await enrichBlame(baseEnrichment, ctx);
+    if (process.env.NODE_ENV !== "production") {
+      console.info(`${LOG_PREFIX} blame enrichment ok`, {
+        filesQueried: result.filesQueried.length,
+        suspectedRegressions:
+          result.enrichment.suspectedRegressions?.length ?? 0,
+      });
+    }
+    return result.enrichment;
+  } catch (error) {
+    // Defensive: `enrichBlame` swallows per-file errors internally, but any
+    // bug at the orchestration layer (e.g. bad token shape) must not take
+    // handoff down.
+    console.warn(`${LOG_PREFIX} blame enrichment threw`, error);
+    return baseEnrichment;
+  }
+}
+
+/// Builds a `BlameContext` that:
+///   - caches `listCommitsForPath` results in-process for the current
+///     handoff (multiple locations on the same file → one API call);
+///   - enforces a file budget (`BLAME_FILE_BUDGET`) so packets with many
+///     locations don't explode the GitHub cost;
+///   - enforces a per-call concurrency cap (`BLAME_CONCURRENCY`);
+///   - enforces a per-call timeout (`BLAME_FETCH_TIMEOUT_MS`).
+function buildBlameContext(params: {
+  token: string;
+  repoLink: PickedRepoLink["repoLink"];
+}): BlameContext {
+  const { token, repoLink } = params;
+  const cache = new Map<string, Promise<BlameCommit[]>>();
+  let budgetRemaining = BLAME_FILE_BUDGET;
+  let inFlight = 0;
+  const waiters: Array<() => void> = [];
+
+  async function acquireSlot(): Promise<void> {
+    if (inFlight < BLAME_CONCURRENCY) {
+      inFlight += 1;
+      return;
+    }
+    await new Promise<void>((resolve) => waiters.push(resolve));
+    inFlight += 1;
+  }
+
+  function releaseSlot(): void {
+    inFlight -= 1;
+    const next = waiters.shift();
+    if (next) next();
+  }
+
+  async function fetchOne(path: string): Promise<BlameCommit[]> {
+    await acquireSlot();
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(
+        () => controller.abort(),
+        BLAME_FETCH_TIMEOUT_MS
+      );
+      try {
+        const commits = await listCommitsForPath(
+          token,
+          repoLink.ownerLogin,
+          repoLink.repoName,
+          path,
+          {
+            ref: repoLink.latestSnapshotCommitSha,
+            perPage: BLAME_COMMITS_PER_FILE,
+          }
+        );
+        return commits.map((c) => ({
+          sha: c.sha,
+          message: c.message,
+          authorLogin: c.authorLogin,
+          authorName: c.authorName,
+          date: c.date,
+          htmlUrl: c.htmlUrl,
+        }));
+      } finally {
+        clearTimeout(timer);
+      }
+    } catch (error) {
+      if (error instanceof GithubApiError && error.status === 404) {
+        // File was renamed/removed between snapshot and blame fetch. Treat
+        // as "no blame" rather than failing the whole enrichment.
+        return [];
+      }
+      // Any other GitHub error (rate limit, network) should surface to the
+      // adapter, which catches per-file rejections and continues.
+      throw error;
+    } finally {
+      releaseSlot();
+    }
+  }
+
+  return {
+    listCommitsForPath: (path) => {
+      const cached = cache.get(path);
+      if (cached) return cached;
+      if (budgetRemaining <= 0) {
+        // Over budget — pretend this file has no blame data.
+        const empty = Promise.resolve<BlameCommit[]>([]);
+        cache.set(path, empty);
+        return empty;
+      }
+      budgetRemaining -= 1;
+      const promise = fetchOne(path);
+      cache.set(path, promise);
+      return promise;
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
