@@ -495,7 +495,21 @@ function scoreCommit(commit: CommitRef, ctx: ScoreContext): ScoredCommit {
 
 export function tokenize(text: string | undefined): Set<string> {
   if (!text) return new Set();
-  const tokens = text
+  // Phase 2.8.1 calibration: split camelCase / PascalCase boundaries
+  // BEFORE lowercasing so identifiers like `submitCheckout` tokenize as
+  // {"submit", "checkout"} and overlap with area/cause text phrased in
+  // plain english. Without this, real-world commit messages quoting
+  // method names score zero against prose area descriptions.
+  //
+  // Three passes cover common identifier shapes:
+  //   - `fooBar` → `foo Bar`
+  //   - `XMLParser` → `XML Parser`
+  //   - `parseJSON2` → `parse JSON 2` (letter→digit boundary)
+  const split = text
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/([A-Z])([A-Z][a-z])/g, "$1 $2")
+    .replace(/([A-Za-z])(\d)/g, "$1 $2");
+  const tokens = split
     .toLowerCase()
     .split(/[^a-z0-9]+/)
     .filter(
