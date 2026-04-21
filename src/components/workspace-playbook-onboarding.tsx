@@ -194,8 +194,21 @@ function TargTypingBubble({
   const [displayBody, setDisplayBody] = useState(() => (active ? "" : body));
   const [typingDone, setTypingDone] = useState(!active);
   const onTypingCompleteRef = useRef(onTypingComplete);
-  onTypingCompleteRef.current = onTypingComplete;
+  // Keep the ref pointed at the latest callback without touching it during
+  // render (which React 19 flags — refs are mutable state and must only be
+  // written in effects or handlers).
+  useEffect(() => {
+    onTypingCompleteRef.current = onTypingComplete;
+  }, [onTypingComplete]);
 
+  /* This effect orchestrates a character-by-character typing animation via
+   * `setTimeout`s. The state updates inside timer callbacks are unavoidable
+   * — they ARE the animation. The up-front `setX("")` calls reset the
+   * buffer when `active`/`title`/`body` change, which is prop-derived state
+   * that genuinely belongs here (there's no render-time way to reset
+   * animation progress when the source text changes).
+   */
+  /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
     if (!active) {
       setDisplayTitle("");
@@ -268,6 +281,7 @@ function TargTypingBubble({
       }
     };
   }, [active, title, body, onTypingTick]);
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   const showCaret = active && !typingDone;
 
