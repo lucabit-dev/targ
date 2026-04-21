@@ -319,15 +319,37 @@ _Case: [<meta.caseId>](<meta.caseUrl>) · generated <meta.generatedAt>_
 
 ## 7. Per-target renderings
 
-Each target's output is **the canonical Markdown plus the deltas below**. Nothing else.
+**Canonical Markdown** is always `renderPacketMarkdown(packet)` (§6). Agent-facing targets
+may add **three kinds of delta** before/after that body: (1) optional preamble, (2) optional
+`## Where to start` (Phase 3.0), (3) mandatory `## Instructions for the agent` where listed.
+Human-facing and clipboard-canonical targets (`markdown`, issue dispatch) use **only** the
+canonical Markdown (plus ticket preambles in §7.5–§7.6), with no Where-to-start block and no
+agent-instructions block.
+
+### 7.0 `## Where to start` (Phase 3.0)
+
+When `repoContext` supplies enough structure (stack locations, blame, suspected regressions,
+`likelyCulprit` / `coCulprits`), the renderer may emit a short section **`## Where to start`**
+so coding agents open the right `path:line` before reading the rest of the packet.
+
+- **Placement** is immediately **before** the canonical Markdown (after any one-line preamble
+  for `cursor` only). GitHub blob links use `owner/repo` + `ref` from `repoContext`; bullets
+  list likely culprit / co-culprit targets first when those fields resolve, else stack or
+  affected-area fallbacks.
+- **Omitted** when no jump target resolves (empty section — the deep link still carries the
+  preamble + canonical packet + instructions).
+- **Implementation:** `src/lib/handoff/agent-jump-targets.ts` (`renderWhereToStartSection`).
+- **Included** for: `cursor`, `claude_code`, `codex`, `copilot_ws`.
+- **Not included** for: `markdown`, `github_issue`, `linear_issue` (canonical body only for
+  tickets; no agent-instruction block either).
 
 ### 7.1 `cursor`
 
 - Output: deep link `cursor://anysphere.cursor-deeplink/prompt?text=<urlencoded>`.
-- Prepend a single line to the canonical text:
+- Prepend a single line **before** the optional `## Where to start` block and the canonical text:
   `You are triaging a bug via TARG. Use the packet below; do not invent evidence.`
-- Append, as a final section:
-  `## Instructions for the agent`
+- Then the optional **`## Where to start`** section (§7.0), then the canonical Markdown, then
+  **`## Instructions for the agent`**:
   `- Read before writing. Do not modify files until you can name the failing boundary.`
   `- If confidence is low, investigate only — do not commit.`
   `- Cite evidence by its number (e.g., "from #2") when you reason.`
@@ -335,21 +357,24 @@ Each target's output is **the canonical Markdown plus the deltas below**. Nothin
 ### 7.2 `claude_code`
 
 - Output: plain text copy payload.
-- Wrap the canonical Markdown inside a single `<targ_handoff>` XML-style tag. Claude
-  treats wrapped context more reliably than raw prose.
-- Append the same `## Instructions for the agent` block as §7.1.
+- Wrap **optional `## Where to start`** (§7.0) **plus** the canonical Markdown inside a single
+  `<targ_handoff>` XML-style tag (Where-to-start first when present). Claude treats wrapped
+  context more reliably than raw prose.
+- Append the same `## Instructions for the agent` block as §7.1, **outside** the XML wrapper
+  (after `</targ_handoff>`), same as today.
 
 ### 7.3 `codex`
 
 - Output: plain text copy payload.
-- Prepend `# Task` as the first line, then the canonical text with `# ` replaced by
-  `## ` in the first heading (Codex expects one top-level heading).
+- Prepend `# Task` as the first line, then **optional `## Where to start`** (§7.0), then the
+  canonical text with `# ` replaced by `## ` in the first heading (Codex expects one top-level
+  heading).
 - Append the same agent-instructions block.
 
 ### 7.4 `copilot_ws`
 
 - Output: plain text copy payload.
-- No wrapper tags. Canonical Markdown as-is.
+- No wrapper tags. **Optional `## Where to start`** (§7.0), then canonical Markdown as-is.
 - Append the agent-instructions block.
 
 ### 7.5 `github_issue`
