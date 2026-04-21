@@ -201,6 +201,27 @@ const W_DIFF_LINE_NEAR = 1;
 const W_BLAME_MATCH = 5;
 
 // ---------------------------------------------------------------------------
+// Phase 2.11 — co-culprit detection
+// ---------------------------------------------------------------------------
+
+/// Max number of co-culprits we'll emit per packet. "commit A broke
+/// the contract, commit B exposed it" is the canonical 2-commit
+/// interaction case; 3 is possible but vanishingly rare in practice
+/// and the chip gets noisy past 2. Capped here to keep rendering
+/// deterministic and the signal focused.
+const MAX_CO_CULPRITS = 2;
+
+/// Max Jaccard similarity between a candidate co-culprit's touched
+/// files and the primary's. 0 means "strictly disjoint" — we only
+/// surface commits that changed non-overlapping files. Any overlap
+/// (even one file) strongly suggests the two commits are variants
+/// of the same change (rebase, merge-squash, cherry-pick of the
+/// same patch) rather than independent contributions to a
+/// two-commit bug. Starting strict; we can relax to 0.1-0.2 if
+/// eval data shows we're missing real interaction cases.
+const MAX_CO_CULPRIT_FILE_OVERLAP = 0;
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -285,6 +306,15 @@ export type CulpritDetectionResult = {
   /// which commits are worth fetching diffs for — typically the first
   /// 2-3. Always includes the picked culprit first (when non-null).
   topCandidateShas: string[];
+  /// Phase 2.11. Additional commits alongside `culprit` that (a)
+  /// independently cleared MIN_SCORE_HIGH, (b) touched file sets
+  /// disjoint from the primary's, and (c) weren't penalised. The
+  /// "commit A broke the contract, commit B exposed it" interaction
+  /// case. Empty array when no runner-up meets the bar. Capped at
+  /// `MAX_CO_CULPRITS` to keep rendering deterministic. Always
+  /// empty when `culprit` is null (no primary → no co-culprit
+  /// relationship to report).
+  coCulprits: LikelyCulprit[];
 };
 
 /// Picks the most-likely culprit from the regressions list, scored against
@@ -303,6 +333,7 @@ export function detectLikelyCulprit(
       topScore: 0,
       runnerUpSha: null,
       topCandidateShas: [],
+      coCulprits: [],
     };
   }
 
@@ -383,6 +414,7 @@ export function detectLikelyCulprit(
       topScore: top.score,
       runnerUpSha: runnerUp?.commit.sha ?? null,
       topCandidateShas,
+      coCulprits: [],
     };
   }
 
@@ -399,6 +431,40 @@ export function detectLikelyCulprit(
     ? NEGATIVE_SIGNAL_CONFIDENCE_CAP
     : rawConfidence;
 
+  // Phase 2.11 — co-culprit detection. A runner-up becomes a
+  // co-culprit when it:
+  //   (a) cleared MIN_SCORE_HIGH on its own (post-penalty score),
+  //   (b) wasn't penalised (a demoted commit riding alongside the
+  //       primary would undermine the "both commits are culpable"
+  //       framing — if it's got a negative mark, surface it through
+  //       the normal suspectedRegressions list instead),
+  //   (c) touched ZERO files in common with the primary (strict
+  //       disjoint — see MAX_CO_CULPRIT_FILE_OVERLAP).
+  //
+  // The strict file-disjointness rule filters out the common false
+  // positive: a merge commit / rebase of the primary that shows up
+  // as a separate row in listCommits but represents the same logical
+  // change. Disjoint file sets are the cheapest reliable signal that
+  // two commits are independent.
+  const primaryFiles = new Set(top.commit.touchedFiles);
+  const coCulprits: LikelyCulprit[] = [];
+  for (let i = 1; i < scored.length && coCulprits.length < MAX_CO_CULPRITS; i++) {
+    const candidate = scored[i];
+    if (candidate.penalized) continue;
+    if (candidate.score < MIN_SCORE_HIGH) continue;
+    if (
+      jaccardOverlap(primaryFiles, new Set(candidate.commit.touchedFiles)) >
+      MAX_CO_CULPRIT_FILE_OVERLAP
+    ) {
+      continue;
+    }
+    coCulprits.push({
+      sha: candidate.commit.sha,
+      confidence: "high",
+      reasons: candidate.reasons,
+    });
+  }
+
   return {
     culprit: {
       sha: top.commit.sha,
@@ -408,7 +474,25 @@ export function detectLikelyCulprit(
     topScore: top.score,
     runnerUpSha: runnerUp?.commit.sha ?? null,
     topCandidateShas,
+    coCulprits,
   };
+}
+
+/// Jaccard index |A ∩ B| / |A ∪ B|. Returns 0 for "both empty"
+/// (safe default: we don't want to treat missing data as strong
+/// similarity). Used as a cheap proxy for "are these two commits
+/// really the same change in disguise?" — see co-culprit detection
+/// above.
+function jaccardOverlap(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 && b.size === 0) return 0;
+  let intersection = 0;
+  const [small, large] = a.size <= b.size ? [a, b] : [b, a];
+  for (const x of small) {
+    if (large.has(x)) intersection += 1;
+  }
+  const union = a.size + b.size - intersection;
+  if (union === 0) return 0;
+  return intersection / union;
 }
 
 /// Convenience that wires the scoring against a `RepoEnrichmentInput`,
@@ -427,6 +511,7 @@ export function detectLikelyCulpritFromEnrichment(
       topScore: 0,
       runnerUpSha: null,
       topCandidateShas: [],
+      coCulprits: [],
     };
   }
   const resolvedFiles = collectResolvedFiles(enrichment);

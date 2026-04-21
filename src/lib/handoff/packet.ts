@@ -84,6 +84,17 @@ export type HandoffPacket = {
     /// claim). Always references a `sha` that exists in
     /// `suspectedRegressions` — invariant 11 enforces this.
     likelyCulprit?: LikelyCulprit;
+    /// Phase 2.11. Additional high-confidence regressions that touched
+    /// DISJOINT file sets from `likelyCulprit` and whose individual
+    /// scores cleared MIN_SCORE_HIGH. Surfaces the "commit A broke the
+    /// contract, commit B exposed it" interaction case — both commits
+    /// are implicated, but they're not variants of the same change
+    /// (file overlap would indicate duplicate / rebase / merge of a
+    /// single logical commit). Always omitted when empty; when
+    /// populated, every entry points at a `sha` that also exists in
+    /// `suspectedRegressions`. Invariant 13 enforces disjointness
+    /// from `likelyCulprit`.
+    coCulprits?: LikelyCulprit[];
     /// Phase 2.10.1. Summary of stack-frame blame that points at
     /// commits OUTSIDE the recent-regression window. When populated,
     /// the renderer emits a note steering the receiver away from
@@ -311,6 +322,10 @@ export type RepoEnrichmentInput = {
   /// Populated only when a candidate clears the medium-confidence
   /// threshold.
   likelyCulprit?: LikelyCulprit;
+  /// Phase 2.11. Additional high-confidence, file-disjoint regressions
+  /// alongside `likelyCulprit`. See `HandoffPacket.repoContext.coCulprits`
+  /// for semantics. Passed through to the packet verbatim.
+  coCulprits?: LikelyCulprit[];
   /// Phase 2.10.1. Summary of stale-and-unmatched stack-frame blame.
   /// Populated by the service layer from blame on `stackLocations` (+
   /// per-evidence `evidenceLocations`). Passed through to
@@ -838,6 +853,23 @@ export function buildHandoffPacket(input: HandoffPacketInput): HandoffPacket {
             ? { suspectedRegressions: regressions }
             : {}),
           ...(culprit ? { likelyCulprit: culprit } : {}),
+          // Phase 2.11: co-culprits pass through verbatim WHEN each
+          // one (a) maps to a commit we're actually shipping and (b)
+          // differs from the primary culprit. Same defence-in-depth
+          // rationale as the likelyCulprit filter above — a
+          // co-culprit pointing at a dropped commit would fail
+          // invariant 13.
+          ...((): Record<string, LikelyCulprit[]> => {
+            const co = enrichment.coCulprits ?? [];
+            if (co.length === 0) return {};
+            const shippedShas = new Set(regressions?.map((r) => r.sha) ?? []);
+            const primarySha = culprit?.sha;
+            const kept = co.filter(
+              (c) =>
+                shippedShas.has(c.sha) && c.sha !== primarySha
+            );
+            return kept.length > 0 ? { coCulprits: kept } : {};
+          })(),
           // Phase 2.10.1: pass staleness through verbatim. The
           // enrichment service has already filtered to "at least 1
           // stale unmatched blame" before populating it, so if
@@ -1147,6 +1179,68 @@ export function assertPacketValid(
           "likely_culprit_must_match_regression",
           `repoContext.likelyCulprit.sha "${culprit.sha}" does not match any suspectedRegressions[*].sha. The culprit must be one of the listed regressions so receivers can audit it.`
         );
+      }
+    }
+
+    // Invariant 13 (Phase 2.11): co-culprits, when present, must each
+    // obey the same shape rules as `likelyCulprit` AND be pairwise
+    // distinct AND not collide with the primary. Distinctness matters
+    // because the renderer emits one chip per co-culprit — dupes
+    // would waste packet real estate on identical information.
+    if (
+      packet.repoContext.coCulprits &&
+      packet.repoContext.coCulprits.length > 0
+    ) {
+      const cos = packet.repoContext.coCulprits;
+      const regressions = packet.repoContext.suspectedRegressions ?? [];
+      const primarySha = packet.repoContext.likelyCulprit?.sha;
+      const seenShas = new Set<string>();
+      for (const co of cos) {
+        if (typeof co.sha !== "string" || co.sha.trim().length === 0) {
+          throw new HandoffPacketInvariantError(
+            "co_culprit_sha_required",
+            "repoContext.coCulprits[*].sha must be a non-empty string."
+          );
+        }
+        if (co.confidence !== "high" && co.confidence !== "medium") {
+          throw new HandoffPacketInvariantError(
+            "co_culprit_confidence_band",
+            `repoContext.coCulprits[*].confidence must be "high" or "medium"; got "${co.confidence}".`
+          );
+        }
+        if (!Array.isArray(co.reasons) || co.reasons.length === 0) {
+          throw new HandoffPacketInvariantError(
+            "co_culprit_reasons_required",
+            "repoContext.coCulprits[*].reasons must be a non-empty array."
+          );
+        }
+        for (const reason of co.reasons) {
+          if (typeof reason !== "string" || reason.trim().length === 0) {
+            throw new HandoffPacketInvariantError(
+              "co_culprit_reasons_required",
+              "Every entry in repoContext.coCulprits[*].reasons must be a non-empty string."
+            );
+          }
+        }
+        if (!regressions.some((r) => r.sha === co.sha)) {
+          throw new HandoffPacketInvariantError(
+            "co_culprit_must_match_regression",
+            `repoContext.coCulprits[*].sha "${co.sha}" does not match any suspectedRegressions[*].sha.`
+          );
+        }
+        if (primarySha && co.sha === primarySha) {
+          throw new HandoffPacketInvariantError(
+            "co_culprit_must_differ_from_primary",
+            `repoContext.coCulprits[*].sha "${co.sha}" duplicates the primary likelyCulprit. Omit co-culprits that match the primary pick.`
+          );
+        }
+        if (seenShas.has(co.sha)) {
+          throw new HandoffPacketInvariantError(
+            "co_culprit_distinct_shas",
+            `repoContext.coCulprits contains duplicate sha "${co.sha}". Each co-culprit must be distinct.`
+          );
+        }
+        seenShas.add(co.sha);
       }
     }
 

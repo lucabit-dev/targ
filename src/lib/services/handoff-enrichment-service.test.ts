@@ -1750,3 +1750,195 @@ describe("applyBlameStaleness", () => {
     expect(result.blameStaleness?.oldest.authorLogin).toBeNull();
   });
 });
+
+// ===========================================================================
+// Phase 2.11 — co-culprit integration
+// ===========================================================================
+//
+// End-to-end: when the service's blame + diff pipeline produces a
+// regressions list with two independent high-scoring commits touching
+// disjoint files, `coCulprits` must appear on the enrichment. We hit
+// only the cheap first-pass code path here (no diff fetching) — the
+// adapter tests already cover the scoring logic in detail.
+
+describe("loadRepoEnrichmentForCase — phase 2.11 co-culprit", () => {
+  function primeTwoFileCase() {
+    caseFindUnique.mockResolvedValueOnce({
+      workspaceId: "ws-1",
+      repoLinkId: "rlink-1",
+    });
+    repoLinkFindUnique.mockResolvedValueOnce(mockRepoLink());
+    // Two distinct resolved files so two DIFFERENT commits can each
+    // score on file-hit ratio without overlapping each other.
+    repoFileFindMany.mockResolvedValueOnce([
+      mockFile("src/lib/checkout.ts"),
+      mockFile("src/lib/gateway.ts"),
+    ]);
+    repoSymbolFindMany.mockResolvedValueOnce([]);
+  }
+
+  it("emits coCulprits when two regressions clear MIN_SCORE_HIGH on disjoint files", async () => {
+    primeTwoFileCase();
+    githubAccountFindUnique.mockResolvedValueOnce({
+      accessTokenEnc: "encrypted-blob",
+    });
+    const recent = new Date(Date.now() - 2 * 86_400_000).toISOString();
+    // Two blame queries (one per unique file) — neither shares a
+    // sha so their commits are independent.
+    getBlameMock.mockResolvedValueOnce(
+      singleRangeBlame({
+        sha: "primary-sha",
+        message:
+          "fix: checkout payment retry race condition gateway service",
+        authorLogin: "alice",
+        authorName: "Alice",
+        date: recent,
+      })
+    );
+    getBlameMock.mockResolvedValueOnce(
+      singleRangeBlame({
+        sha: "co-sha",
+        message:
+          "refactor: payment retry helper gateway service area",
+        authorLogin: "bob",
+        authorName: "Bob",
+        date: recent,
+      })
+    );
+    // listCommits fires twice (one per unique file). Each file's
+    // history contains only its own commit, so when aggregated
+    // the regressions list has two distinct commits with
+    // disjoint touchedFiles.
+    listCommitsMock.mockResolvedValueOnce([
+      {
+        sha: "primary-sha",
+        message:
+          "fix: checkout payment retry race condition gateway service",
+        authorLogin: "alice",
+        authorName: "Alice",
+        authorEmail: null,
+        date: recent,
+        htmlUrl: "https://github.com/acme/checkout/commit/primary-sha",
+      },
+    ]);
+    listCommitsMock.mockResolvedValueOnce([
+      {
+        sha: "co-sha",
+        message:
+          "refactor: payment retry helper gateway service area",
+        authorLogin: "bob",
+        authorName: "Bob",
+        authorEmail: null,
+        date: recent,
+        htmlUrl: "https://github.com/acme/checkout/commit/co-sha",
+      },
+    ]);
+
+    // Override the diagnosis so the LLM-side signal points at both
+    // commits' shared keyword cluster (checkout / payment / retry /
+    // gateway), giving each one enough score + file-hit to clear
+    // MIN_SCORE_HIGH.
+    const input = sampleInput();
+    input.diagnosis = diagnosisVM({
+      affectedArea: "checkout payment retry",
+      probableRootCause: "gateway retry helper race",
+      summary: "Payment retries race in the checkout gateway.",
+    });
+    // Stack frame must hit ONE of the two files so resolver picks
+    // it up; it doesn't matter which — both files are resolved via
+    // repoFileFindMany above.
+    input.evidence = [
+      evidenceVM({
+        extracted: {
+          stackFrames: ["at foo (src/lib/checkout.ts:42:3)"],
+        },
+      }),
+    ];
+
+    const result = await loadRepoEnrichmentForCase({
+      userId: "u1",
+      caseId: "case-1",
+      input,
+    });
+
+    expect(result?.likelyCulprit).toBeDefined();
+    // The primary could be either commit depending on tiebreakers
+    // (they score very similarly). What matters: we have exactly
+    // two high-scorers in the list and the non-primary one lands
+    // in coCulprits.
+    expect(result?.coCulprits).toBeDefined();
+    expect(result?.coCulprits?.length).toBeGreaterThanOrEqual(1);
+    const primarySha = result!.likelyCulprit!.sha;
+    const coShas = result!.coCulprits!.map((c) => c.sha);
+    expect(coShas).not.toContain(primarySha);
+    // Sanity: the two shas we primed are the only candidates.
+    for (const sha of coShas) {
+      expect(["primary-sha", "co-sha"]).toContain(sha);
+    }
+  });
+
+  it("does NOT emit coCulprits when regressions touch overlapping files (same-change duplicate)", async () => {
+    primeTwoFileCase();
+    githubAccountFindUnique.mockResolvedValueOnce({
+      accessTokenEnc: "encrypted-blob",
+    });
+    const recent = new Date(Date.now() - 2 * 86_400_000).toISOString();
+    // Same sha on BOTH files → one commit touching both. When
+    // aggregated, there's only one regression row, so there's
+    // nothing to co-culprit anyway.
+    getBlameMock.mockResolvedValueOnce(
+      singleRangeBlame({
+        sha: "same-sha",
+        message:
+          "fix: checkout payment retry race condition gateway service",
+        authorLogin: "alice",
+        date: recent,
+      })
+    );
+    getBlameMock.mockResolvedValueOnce(
+      singleRangeBlame({
+        sha: "same-sha",
+        message:
+          "fix: checkout payment retry race condition gateway service",
+        authorLogin: "alice",
+        date: recent,
+      })
+    );
+    listCommitsMock.mockResolvedValueOnce([
+      {
+        sha: "same-sha",
+        message: "fix: checkout payment retry gateway",
+        authorLogin: "alice",
+        authorName: "Alice",
+        authorEmail: null,
+        date: recent,
+        htmlUrl: "https://github.com/acme/checkout/commit/same-sha",
+      },
+    ]);
+    listCommitsMock.mockResolvedValueOnce([
+      {
+        sha: "same-sha",
+        message: "fix: checkout payment retry gateway",
+        authorLogin: "alice",
+        authorName: "Alice",
+        authorEmail: null,
+        date: recent,
+        htmlUrl: "https://github.com/acme/checkout/commit/same-sha",
+      },
+    ]);
+
+    const input = sampleInput();
+    input.diagnosis = diagnosisVM({
+      affectedArea: "checkout payment retry",
+      probableRootCause: "gateway retry helper race",
+    });
+
+    const result = await loadRepoEnrichmentForCase({
+      userId: "u1",
+      caseId: "case-1",
+      input,
+    });
+
+    expect(result?.coCulprits).toBeUndefined();
+  });
+});

@@ -1444,3 +1444,287 @@ describe("phase 2.10.1 — blame staleness invariants", () => {
     ).toThrow(/blame_staleness_age_required/);
   });
 });
+
+// =============================================================================
+// Phase 2.11 — co-culprit rendering + invariants
+// =============================================================================
+
+describe("phase 2.11 — co-culprit rendering", () => {
+  // Build a packet with a primary culprit + N co-culprits. Each
+  // co-culprit has its own suspectedRegressions entry so the
+  // renderer can resolve it back to a CommitRef.
+  function buildCoCulpritPacket(
+    co: Array<{
+      sha: string;
+      message?: string;
+      author?: string;
+      reasons: string[];
+      touchedFiles?: string[];
+    }>
+  ) {
+    const primarySha = "primarysha0000000000000000000000000cafe1";
+    const primary = {
+      sha: primarySha,
+      message: "fix: primary",
+      author: "alice",
+      date: new Date(Date.now() - 86_400_000).toISOString(),
+      prNumber: 100,
+      url: `https://github.com/acme/checkout/commit/${primarySha}`,
+      touchedFiles: ["src/primary.ts"],
+    };
+    const coRegressions = co.map((c, i) => ({
+      sha: c.sha,
+      message: c.message ?? `refactor co-${i}`,
+      author: c.author ?? "bob",
+      date: new Date(Date.now() - (i + 2) * 86_400_000).toISOString(),
+      prNumber: 200 + i,
+      url: `https://github.com/acme/checkout/commit/${c.sha}`,
+      touchedFiles: c.touchedFiles ?? [`src/co-${i}.ts`],
+    }));
+
+    return buildHandoffPacket({
+      ...CONTRADICTION_FIXTURE_INPUT,
+      repoEnrichment: {
+        repoFullName: "acme/checkout",
+        ref: "deadbeef0000000000000000000000000000cafe",
+        suspectedRegressions: [primary, ...coRegressions],
+        likelyCulprit: {
+          sha: primarySha,
+          confidence: "high",
+          reasons: ["matches affected area"],
+        },
+        coCulprits: co.map((c) => ({
+          sha: c.sha,
+          confidence: "high",
+          reasons: c.reasons,
+        })),
+      },
+    });
+  }
+
+  it("renders one **Co-culprit:** chip per entry below the primary", () => {
+    const markdown = renderPacketMarkdown(
+      buildCoCulpritPacket([
+        {
+          sha: "cosha1000000000000000000000000000000cafe",
+          message: "refactor: gateway retry",
+          reasons: ["matches probable root cause"],
+        },
+      ])
+    );
+    // Both chips present.
+    expect(markdown).toContain("**Likely culprit:**");
+    expect(markdown).toContain("**Co-culprit:**");
+    // Primary comes first (order matters — primary is the headline
+    // answer, co-culprit is supporting context).
+    const primaryIdx = markdown.indexOf("**Likely culprit:**");
+    const coIdx = markdown.indexOf("**Co-culprit:**");
+    expect(primaryIdx).toBeGreaterThan(-1);
+    expect(coIdx).toBeGreaterThan(primaryIdx);
+  });
+
+  it("renders multiple co-culprit chips in order when more than one qualifies", () => {
+    const markdown = renderPacketMarkdown(
+      buildCoCulpritPacket([
+        {
+          sha: "cosha1000000000000000000000000000000cafe",
+          message: "refactor: gateway",
+          reasons: ["matches affected area"],
+        },
+        {
+          sha: "cosha2000000000000000000000000000000cafe",
+          message: "refactor: retry helper",
+          reasons: ["matches probable root cause"],
+        },
+      ])
+    );
+    const chips = markdown.match(/\*\*Co-culprit:\*\*/g) ?? [];
+    expect(chips).toHaveLength(2);
+    // Both distinct messages land in the output.
+    expect(markdown).toContain("refactor: gateway");
+    expect(markdown).toContain("refactor: retry helper");
+  });
+
+  it("tags the suspected-regressions list with '← **co-culprit**' for co-culprit rows", () => {
+    // Receiver who scrolls down to the full regressions list
+    // needs to match rows back to the chips at the top.
+    const markdown = renderPacketMarkdown(
+      buildCoCulpritPacket([
+        {
+          sha: "cosha1000000000000000000000000000000cafe",
+          message: "refactor: gateway",
+          reasons: ["matches probable root cause"],
+        },
+      ])
+    );
+    expect(markdown).toContain("← **co-culprit**");
+    // Primary tag still present.
+    expect(markdown).toContain("← **likely culprit");
+  });
+
+  it("applies the same reason-priority ordering as the primary chip (negatives > blame > diff > others)", () => {
+    // Normally a co-culprit can't be penalised (the scorer blocks
+    // those), so "but ..." reasons don't usually appear. But the
+    // renderer is the source of truth for chip rendering, and it
+    // should order reasons identically for symmetry with the
+    // primary — future changes to the scorer rules shouldn't also
+    // require renderer changes.
+    const markdown = renderPacketMarkdown(
+      buildCoCulpritPacket([
+        {
+          sha: "cosha1000000000000000000000000000000cafe",
+          message: "refactor: gateway",
+          reasons: [
+            "matches affected area",
+            "diff touches src/co.ts:10 (stack frame)",
+            "blame on src/co.ts:10 points to this commit",
+          ],
+        },
+      ])
+    );
+    // Extract the chip rationale, which lives inside `_(...)_`.
+    const coChip = markdown.match(/\*\*Co-culprit:\*\*[\s\S]*?_\(([\s\S]+?)\)_/);
+    expect(coChip).not.toBeNull();
+    const rationale = coChip![1];
+    // blame before diff-hit before generic positive.
+    const blameIdx = rationale.indexOf("blame on");
+    const diffIdx = rationale.indexOf("diff touches");
+    const areaIdx = rationale.indexOf("matches affected area");
+    expect(blameIdx).toBeLessThan(diffIdx);
+    expect(diffIdx).toBeLessThan(areaIdx);
+  });
+
+  it("renders no Co-culprit chip when the packet has none (pre-2.11 baseline)", () => {
+    // Baseline: a plain packet with no co-culprits should render
+    // identically to pre-2.11 output. Regression guard against
+    // accidentally emitting an empty "**Co-culprit:**" line.
+    const markdown = renderPacketMarkdown(
+      buildHandoffPacket(CONTRADICTION_FIXTURE_INPUT)
+    );
+    expect(markdown).not.toContain("**Co-culprit:**");
+    expect(markdown).not.toContain("← **co-culprit**");
+  });
+});
+
+describe("phase 2.11 — co-culprit invariants", () => {
+  // These tests tamper with the packet AFTER building so the
+  // assert-time checks are what fires (the builder already filters
+  // malformed co-culprits as defence-in-depth).
+  function baseBuiltPacket(): ReturnType<typeof buildHandoffPacket> {
+    const primarySha = "primarysha0000000000000000000000000cafe1";
+    return buildHandoffPacket({
+      ...CONTRADICTION_FIXTURE_INPUT,
+      repoEnrichment: {
+        repoFullName: "acme/checkout",
+        ref: "deadbeef0000000000000000000000000000cafe",
+        suspectedRegressions: [
+          {
+            sha: primarySha,
+            message: "fix: primary",
+            author: "alice",
+            date: new Date(Date.now() - 86_400_000).toISOString(),
+            touchedFiles: ["src/primary.ts"],
+          },
+          {
+            sha: "cosha1000000000000000000000000000000cafe",
+            message: "refactor",
+            author: "bob",
+            date: new Date(Date.now() - 2 * 86_400_000).toISOString(),
+            touchedFiles: ["src/co.ts"],
+          },
+        ],
+        likelyCulprit: {
+          sha: primarySha,
+          confidence: "high",
+          reasons: ["matches"],
+        },
+        coCulprits: [
+          {
+            sha: "cosha1000000000000000000000000000000cafe",
+            confidence: "high",
+            reasons: ["matches"],
+          },
+        ],
+      },
+    });
+  }
+
+  it("accepts a well-formed coCulprits list", () => {
+    expect(() =>
+      assertPacketValid(baseBuiltPacket(), knownEvidenceIdsFromInput())
+    ).not.toThrow();
+  });
+
+  it("rejects a co-culprit with an empty sha", () => {
+    const packet = baseBuiltPacket();
+    packet.repoContext!.coCulprits![0] = {
+      ...packet.repoContext!.coCulprits![0],
+      sha: "  ",
+    };
+    expect(() =>
+      assertPacketValid(packet, knownEvidenceIdsFromInput())
+    ).toThrow(/co_culprit_sha_required/);
+  });
+
+  it("rejects a co-culprit with confidence outside {high, medium}", () => {
+    const packet = baseBuiltPacket();
+    packet.repoContext!.coCulprits![0] = {
+      ...packet.repoContext!.coCulprits![0],
+      confidence: "low" as unknown as "high" | "medium",
+    };
+    expect(() =>
+      assertPacketValid(packet, knownEvidenceIdsFromInput())
+    ).toThrow(/co_culprit_confidence_band/);
+  });
+
+  it("rejects a co-culprit with empty reasons", () => {
+    const packet = baseBuiltPacket();
+    packet.repoContext!.coCulprits![0] = {
+      ...packet.repoContext!.coCulprits![0],
+      reasons: [],
+    };
+    expect(() =>
+      assertPacketValid(packet, knownEvidenceIdsFromInput())
+    ).toThrow(/co_culprit_reasons_required/);
+  });
+
+  it("rejects a co-culprit whose sha isn't in suspectedRegressions", () => {
+    const packet = baseBuiltPacket();
+    packet.repoContext!.coCulprits![0] = {
+      ...packet.repoContext!.coCulprits![0],
+      sha: "orphansha",
+    };
+    expect(() =>
+      assertPacketValid(packet, knownEvidenceIdsFromInput())
+    ).toThrow(/co_culprit_must_match_regression/);
+  });
+
+  it("rejects a co-culprit that duplicates the primary sha", () => {
+    const packet = baseBuiltPacket();
+    const primarySha = packet.repoContext!.likelyCulprit!.sha;
+    packet.repoContext!.coCulprits![0] = {
+      ...packet.repoContext!.coCulprits![0],
+      sha: primarySha,
+    };
+    expect(() =>
+      assertPacketValid(packet, knownEvidenceIdsFromInput())
+    ).toThrow(/co_culprit_must_differ_from_primary/);
+  });
+
+  it("rejects two co-culprits with duplicate shas", () => {
+    const packet = baseBuiltPacket();
+    const sha = packet.repoContext!.coCulprits![0].sha;
+    // Push a duplicate that points at the same commit.
+    packet.repoContext!.suspectedRegressions!.push({
+      ...packet.repoContext!.suspectedRegressions![1],
+    });
+    packet.repoContext!.coCulprits!.push({
+      sha,
+      confidence: "high",
+      reasons: ["dup"],
+    });
+    expect(() =>
+      assertPacketValid(packet, knownEvidenceIdsFromInput())
+    ).toThrow(/co_culprit_distinct_shas/);
+  });
+});

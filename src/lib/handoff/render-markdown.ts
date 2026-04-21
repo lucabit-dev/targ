@@ -92,6 +92,16 @@ function renderBestRead(packet: HandoffPacket): string {
     lines.push("", culpritChip);
   }
 
+  // Phase 2.11: co-culprit chips below the primary. Each one renders
+  // as its own line to keep the rationales readable — collapsing
+  // multiple co-culprits into a shared chip would make it hard to
+  // see which reason belongs to which commit. Order matches the
+  // scorer's ranking (highest score first) so the most-likely
+  // secondary cause appears nearest the primary.
+  for (const chip of formatCoCulpritChips(packet)) {
+    lines.push("", chip);
+  }
+
   // Phase 2.10.1: stack-frame blame staleness. Two rendering modes:
   //   - Strong: NO culprit and every stack blame is stale and
   //     unmatched → prominent "probably not a recent regression"
@@ -236,6 +246,69 @@ function formatLikelyCulpritChip(packet: HandoffPacket): string {
   return wrap(
     `**${confidenceWord}:** ${linked} — "${matched.message}" \u00b7 @${matched.author} \u00b7 ${when} _(${reasons})_`
   );
+}
+
+/// Renders one chip per `repoContext.coCulprits` entry (Phase 2.11).
+/// Each chip has the same visual shape as the primary culprit chip but
+/// uses the label "Co-culprit" to signal "this commit is implicated
+/// alongside the primary, not instead of it".
+///
+/// Returns an empty array when:
+///   - `coCulprits` is missing or empty (the overwhelmingly common case
+///     — most packets have 0-1 culprit, the 2-commit interaction is
+///     rare);
+///   - no co-culprit resolves to a `suspectedRegressions[*]` entry —
+///     invariant 13 should have caught this, but we degrade gracefully.
+///
+/// Reason ordering matches `formatLikelyCulpritChip` so both chips look
+/// consistent side-by-side.
+function formatCoCulpritChips(packet: HandoffPacket): string[] {
+  const ctx = packet.repoContext;
+  const coCulprits = ctx?.coCulprits ?? [];
+  if (coCulprits.length === 0) return [];
+
+  const chips: string[] = [];
+  for (const co of coCulprits) {
+    const matched = ctx!.suspectedRegressions?.find(
+      (r) => r.sha === co.sha
+    );
+    if (!matched) continue;
+
+    const label = matched.prNumber
+      ? `#${matched.prNumber}`
+      : matched.sha.slice(0, 7);
+    const url = buildCommitRefUrl(matched, ctx!);
+    const linked = url ? `[${label}](${url})` : label;
+    const when = formatRelativeDate(matched.date);
+
+    // "Co-culprit" is a single fixed label regardless of confidence —
+    // the scorer only emits co-culprits at high confidence (see
+    // Phase 2.11 detection rules), and varying the label across
+    // entries would make the chip grid harder to scan.
+    const confidenceWord = "Co-culprit";
+
+    const isNegative = (r: string) => r.startsWith("but ");
+    const isBlameMatch = (r: string) => r.startsWith("blame on ");
+    const isDiffHit = (r: string) => r.startsWith("diff touches ");
+    const isPriority = (r: string) =>
+      isNegative(r) || isBlameMatch(r) || isDiffHit(r);
+    const orderedReasons = [
+      ...co.reasons.filter(isNegative),
+      ...co.reasons.filter((r) => !isNegative(r) && isBlameMatch(r)),
+      ...co.reasons.filter(
+        (r) => !isNegative(r) && !isBlameMatch(r) && isDiffHit(r)
+      ),
+      ...co.reasons.filter((r) => !isPriority(r)),
+    ];
+    const reasons = orderedReasons.slice(0, 3).join(" \u00b7 ");
+
+    chips.push(
+      wrap(
+        `**${confidenceWord}:** ${linked} — "${matched.message}" \u00b7 @${matched.author} \u00b7 ${when} _(${reasons})_`
+      )
+    );
+  }
+  return chips;
 }
 
 /// Compact inline blame suffix, e.g. `(@alice · #842 · 2d ago)`. Used in
@@ -429,6 +502,12 @@ function renderRepoContext(packet: HandoffPacket): string {
     lines.push("- Suspected recent regressions:");
     for (const commit of ctx.suspectedRegressions) {
       const isCulprit = ctx.likelyCulprit?.sha === commit.sha;
+      // Phase 2.11: co-culprits also get a marker so a receiver
+      // scrolling through the suspected list can immediately see
+      // which rows were elevated to chips at the top.
+      const isCoCulprit =
+        !isCulprit &&
+        (ctx.coCulprits ?? []).some((c) => c.sha === commit.sha);
       const bullet = formatSuspectedRegressionBullet(commit, ctx);
       // Mark the culprit row so the receiver who scrolls down to the
       // regressions list can match it back to the chip at the top of the
@@ -436,7 +515,9 @@ function renderRepoContext(packet: HandoffPacket): string {
       // the chip, not here.
       const suffix = isCulprit
         ? ` ← **likely culprit (${ctx.likelyCulprit?.confidence})**`
-        : "";
+        : isCoCulprit
+          ? ` ← **co-culprit**`
+          : "";
       lines.push(`  - ${bullet}${suffix}`);
     }
   }

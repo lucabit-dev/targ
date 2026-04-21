@@ -289,7 +289,11 @@ async function applyCulpritDetection(params: {
   const stackLines = collectResolvedStackLines(enrichment);
   const topShas = firstPass.topCandidateShas.slice(0, DIFF_AWARE_TOP_K);
   if (stackLines.length === 0 || topShas.length === 0) {
-    return finaliseCulprit(enrichment, firstPass.culprit);
+    return finaliseCulprit(
+      enrichment,
+      firstPass.culprit,
+      firstPass.coCulprits
+    );
   }
 
   const diffProbesBySha = await fetchDiffProbes({
@@ -299,7 +303,11 @@ async function applyCulpritDetection(params: {
   });
   if (diffProbesBySha.size === 0) {
     // No usable diffs → keep first-pass pick.
-    return finaliseCulprit(enrichment, firstPass.culprit);
+    return finaliseCulprit(
+      enrichment,
+      firstPass.culprit,
+      firstPass.coCulprits
+    );
   }
 
   let secondPass;
@@ -311,7 +319,11 @@ async function applyCulpritDetection(params: {
     });
   } catch (error) {
     console.warn(`${LOG_PREFIX} culprit detection (second pass) threw`, error);
-    return finaliseCulprit(enrichment, firstPass.culprit);
+    return finaliseCulprit(
+      enrichment,
+      firstPass.culprit,
+      firstPass.coCulprits
+    );
   }
 
   if (process.env.NODE_ENV !== "production") {
@@ -327,7 +339,11 @@ async function applyCulpritDetection(params: {
     });
   }
 
-  return finaliseCulprit(enrichment, secondPass.culprit);
+  return finaliseCulprit(
+    enrichment,
+    secondPass.culprit,
+    secondPass.coCulprits
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -456,10 +472,21 @@ export function applyBlameStaleness(
 
 function finaliseCulprit(
   enrichment: RepoEnrichmentInput,
-  culprit: RepoEnrichmentInput["likelyCulprit"] | null
+  culprit: RepoEnrichmentInput["likelyCulprit"] | null,
+  coCulprits: NonNullable<RepoEnrichmentInput["coCulprits"]> = []
 ): RepoEnrichmentInput {
+  // No primary → no co-culprits (the co-culprit relationship is
+  // meaningful only alongside a confirmed primary; solo high-
+  // scoring commits should appear as the primary instead). The
+  // scorer already enforces this invariant, but we belt-and-brace
+  // here so a future refactor can't accidentally ship co-culprits
+  // without a primary.
   if (!culprit) return enrichment;
-  return { ...enrichment, likelyCulprit: culprit };
+  return {
+    ...enrichment,
+    likelyCulprit: culprit,
+    ...(coCulprits.length > 0 ? { coCulprits } : {}),
+  };
 }
 
 /// Harvests (file, line) pairs from the already-resolved stack

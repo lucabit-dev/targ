@@ -90,6 +90,7 @@ describe("detectLikelyCulprit", () => {
       topScore: 0,
       runnerUpSha: null,
       topCandidateShas: [],
+      coCulprits: [],
     });
   });
 
@@ -1481,5 +1482,244 @@ describe("detectLikelyCulprit — blame cross-check (Phase 2.10)", () => {
     });
     expect(without.topScore).toBe(withEmpty.topScore);
     expect(without.culprit?.sha).toBe(withEmpty.culprit?.sha);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 2.11 — co-culprit detection
+// ---------------------------------------------------------------------------
+//
+// A co-culprit is a runner-up that (a) independently clears MIN_SCORE_HIGH,
+// (b) wasn't penalised, and (c) touched file sets disjoint from the
+// primary. Captures the "commit A broke the contract, commit B exposed
+// it" interaction case.
+
+describe("detectLikelyCulprit — co-culprit detection (Phase 2.11)", () => {
+  // Both commits score high independently (area + cause + file hit).
+  // Different files → disjoint, so they're not variants of the same
+  // change.
+  function highScoringPrimary(): CommitRef {
+    return commit({
+      sha: "primary-sha",
+      message: "fix: checkout payment retry race in service",
+      touchedFiles: ["src/lib/checkout.ts"],
+      date: "2026-04-19T00:00:00Z",
+    });
+  }
+
+  function highScoringCoCandidate(): CommitRef {
+    return commit({
+      sha: "co-sha",
+      message: "refactor: payment retry helper in gateway service",
+      touchedFiles: ["src/lib/gateway.ts"],
+      date: "2026-04-18T00:00:00Z",
+    });
+  }
+
+  const richSignals = {
+    affectedArea: "checkout payment retry",
+    probableRootCause: "gateway service race in retry helper",
+    resolvedFiles: ["src/lib/checkout.ts", "src/lib/gateway.ts"],
+    now: NOW,
+  };
+
+  it("surfaces a file-disjoint high-scoring runner-up as a co-culprit", () => {
+    const result = detectLikelyCulprit(
+      [highScoringPrimary(), highScoringCoCandidate()],
+      richSignals
+    );
+    expect(result.culprit?.sha).toBe("primary-sha");
+    expect(result.coCulprits).toHaveLength(1);
+    expect(result.coCulprits[0].sha).toBe("co-sha");
+    expect(result.coCulprits[0].confidence).toBe("high");
+    expect(result.coCulprits[0].reasons.length).toBeGreaterThan(0);
+  });
+
+  it("suppresses a runner-up that shares any touched file with the primary (likely the same change)", () => {
+    // Same file in both → Jaccard > 0 → suppressed. This is the
+    // "merge/rebase/cherry-pick duplicate" filter.
+    const overlapping = commit({
+      sha: "co-sha",
+      message: "refactor: payment retry helper in gateway service",
+      // One of these files is also in primary.touchedFiles.
+      touchedFiles: ["src/lib/checkout.ts", "src/lib/gateway.ts"],
+      date: "2026-04-18T00:00:00Z",
+    });
+    const result = detectLikelyCulprit(
+      [highScoringPrimary(), overlapping],
+      richSignals
+    );
+    expect(result.culprit?.sha).toBe("primary-sha");
+    expect(result.coCulprits).toEqual([]);
+  });
+
+  it("suppresses a runner-up that scored below MIN_SCORE_HIGH on its own", () => {
+    // The co-candidate has files disjoint from primary but only
+    // matches area (score 2), well below MIN_SCORE_HIGH (4).
+    const weak = commit({
+      sha: "co-sha",
+      message: "chore: checkout rename",
+      touchedFiles: ["src/lib/gateway.ts"],
+      date: "2026-04-18T00:00:00Z",
+    });
+    const result = detectLikelyCulprit(
+      [highScoringPrimary(), weak],
+      richSignals
+    );
+    expect(result.culprit?.sha).toBe("primary-sha");
+    expect(result.coCulprits).toEqual([]);
+  });
+
+  it("suppresses a penalised runner-up even if it scored high", () => {
+    // High raw score but test-only → penalised, so even if
+    // post-penalty score is still >= MIN_SCORE_HIGH we refuse to
+    // surface it as a co-culprit. The "both commits are culpable"
+    // framing requires clean commits.
+    const penalised = commit({
+      sha: "co-sha",
+      message:
+        "test: checkout payment retry race gateway service helper coverage",
+      // test-only files → kind-only penalty fires regardless of
+      // score.
+      touchedFiles: [
+        "src/lib/__tests__/gateway.test.ts",
+        "src/lib/__tests__/retry.test.ts",
+      ],
+      date: "2026-04-18T00:00:00Z",
+    });
+    const result = detectLikelyCulprit(
+      [highScoringPrimary(), penalised],
+      richSignals
+    );
+    expect(result.culprit?.sha).toBe("primary-sha");
+    expect(result.coCulprits).toEqual([]);
+  });
+
+  it("caps co-culprits at 2 even when more qualify", () => {
+    // Three high-scoring commits all touching disjoint files.
+    // The scorer must still cap at MAX_CO_CULPRITS = 2 (so at most
+    // 2 co-culprits alongside the primary).
+    const c1 = commit({
+      sha: "c-one",
+      message: "fix: checkout payment retry gateway service",
+      touchedFiles: ["src/lib/a.ts"],
+      date: "2026-04-19T01:00:00Z",
+    });
+    const c2 = commit({
+      sha: "c-two",
+      message: "fix: checkout payment retry gateway service",
+      touchedFiles: ["src/lib/b.ts"],
+      date: "2026-04-19T02:00:00Z",
+    });
+    const c3 = commit({
+      sha: "c-three",
+      message: "fix: checkout payment retry gateway service",
+      touchedFiles: ["src/lib/c.ts"],
+      date: "2026-04-19T03:00:00Z",
+    });
+    const c4 = commit({
+      sha: "c-four",
+      message: "fix: checkout payment retry gateway service",
+      touchedFiles: ["src/lib/d.ts"],
+      date: "2026-04-19T04:00:00Z",
+    });
+    const result = detectLikelyCulprit([c1, c2, c3, c4], {
+      ...richSignals,
+      resolvedFiles: ["src/lib/a.ts", "src/lib/b.ts", "src/lib/c.ts", "src/lib/d.ts"],
+    });
+    expect(result.culprit).not.toBeNull();
+    expect(result.coCulprits).toHaveLength(2);
+    // Must not include the primary SHA.
+    const primarySha = result.culprit!.sha;
+    for (const co of result.coCulprits) {
+      expect(co.sha).not.toBe(primarySha);
+    }
+  });
+
+  it("returns an empty coCulprits array when there's only one regression", () => {
+    const result = detectLikelyCulprit([highScoringPrimary()], richSignals);
+    expect(result.culprit?.sha).toBe("primary-sha");
+    expect(result.coCulprits).toEqual([]);
+  });
+
+  it("returns an empty coCulprits array when the primary was null (nothing to partner with)", () => {
+    // No signals → primary below threshold → null. Even if the
+    // runner-up had strong signal, we'd have nothing to make it
+    // co-culprit alongside. Verifies we never ship co-culprits
+    // without a primary.
+    const weak = commit({
+      sha: "weak-a",
+      message: "chore: rename",
+      touchedFiles: ["src/lib/x.ts"],
+      date: "2026-04-19T00:00:00Z",
+    });
+    const weaker = commit({
+      sha: "weak-b",
+      message: "chore: rename",
+      touchedFiles: ["src/lib/y.ts"],
+      date: "2026-04-19T00:00:00Z",
+    });
+    const result = detectLikelyCulprit([weak, weaker], {
+      affectedArea: "unrelated topic",
+      now: NOW,
+    });
+    expect(result.culprit).toBeNull();
+    expect(result.coCulprits).toEqual([]);
+  });
+
+  it("never duplicates the primary sha in coCulprits", () => {
+    // Loop-correctness guard: scored[0] is the primary, so the
+    // co-culprit scan starts at index 1. Regression test for the
+    // off-by-one we'd introduce if we forgot to skip index 0.
+    const result = detectLikelyCulprit(
+      [highScoringPrimary(), highScoringCoCandidate()],
+      richSignals
+    );
+    const primary = result.culprit!.sha;
+    for (const co of result.coCulprits) {
+      expect(co.sha).not.toBe(primary);
+    }
+  });
+
+  it("orders co-culprits by score (highest-qualifying-runner-up first)", () => {
+    // c-hi has stronger match (2 area hits + file hit), c-lo only
+    // has area + file. Both disjoint from primary. c-hi should
+    // appear first.
+    const primary = commit({
+      sha: "primary-sha",
+      message: "fix: checkout payment retry race service",
+      touchedFiles: ["src/lib/checkout.ts"],
+      date: "2026-04-19T00:00:00Z",
+    });
+    const hi = commit({
+      sha: "c-hi",
+      message:
+        "refactor: payment retry helper race condition gateway service",
+      touchedFiles: ["src/lib/gateway.ts"],
+      date: "2026-04-18T00:00:00Z",
+    });
+    const lo = commit({
+      sha: "c-lo",
+      message: "refactor: payment retry gateway service",
+      touchedFiles: ["src/lib/helper.ts"],
+      date: "2026-04-17T00:00:00Z",
+    });
+    const result = detectLikelyCulprit([primary, hi, lo], {
+      ...richSignals,
+      resolvedFiles: [
+        "src/lib/checkout.ts",
+        "src/lib/gateway.ts",
+        "src/lib/helper.ts",
+      ],
+    });
+    expect(result.culprit?.sha).toBe("primary-sha");
+    // At least hi should come before lo (both may be present, or
+    // only hi if lo fails the threshold).
+    const shas = result.coCulprits.map((c) => c.sha);
+    if (shas.includes("c-hi") && shas.includes("c-lo")) {
+      expect(shas.indexOf("c-hi")).toBeLessThan(shas.indexOf("c-lo"));
+    } else {
+      expect(shas).toContain("c-hi");
+    }
   });
 });
