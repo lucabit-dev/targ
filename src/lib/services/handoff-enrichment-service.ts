@@ -39,7 +39,7 @@ import {
   type EnrichmentContext,
 } from "@/lib/handoff/repo-enrichment";
 import {
-  diffTouchesLine,
+  diffDistanceToLine,
   getCommitDiff,
   getFileBlameRanges,
   GithubApiError,
@@ -385,8 +385,11 @@ async function fetchDiffProbes(params: {
         sha,
       });
       if (diff) {
+        // Phase 2.9.1: probe returns distance (null | number), not a
+        // boolean, so the scorer can award both exact-hit and
+        // near-hit credit from the same probe.
         probes.set(sha, (file: string, line: number) =>
-          diffTouchesLine(diff, file, line)
+          diffDistanceToLine(diff, file, line)
         );
       }
     }

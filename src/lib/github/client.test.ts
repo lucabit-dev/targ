@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  diffDistanceToLine,
   diffTouchesLine,
   exchangeCodeForToken,
   getAuthenticatedUser,
@@ -758,6 +759,96 @@ describe("github client", () => {
       };
       // newStart 9 + newLines 0 → the hunk covers no post-change line.
       expect(diffTouchesLine(delOnly, "src/a.ts", 9)).toBe(false);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Phase 2.9.1 — line proximity
+  // -------------------------------------------------------------------------
+
+  describe("diffDistanceToLine", () => {
+    const diff = {
+      sha: "x",
+      truncated: false,
+      files: [
+        {
+          path: "src/a.ts",
+          previousPath: null,
+          status: "modified" as const,
+          additions: 2,
+          deletions: 1,
+          hunks: [
+            // Covers lines [10, 16].
+            { oldStart: 10, oldLines: 5, newStart: 10, newLines: 7 },
+            // Covers lines [42, 43].
+            { oldStart: 40, oldLines: 2, newStart: 42, newLines: 2 },
+          ],
+        },
+        {
+          path: "src/renamed.ts",
+          previousPath: "src/old.ts",
+          status: "renamed" as const,
+          additions: 1,
+          deletions: 0,
+          hunks: [{ oldStart: 1, oldLines: 1, newStart: 5, newLines: 3 }],
+        },
+      ],
+    };
+
+    it("returns 0 when the line is exactly inside a hunk", () => {
+      expect(diffDistanceToLine(diff, "src/a.ts", 10)).toBe(0);
+      expect(diffDistanceToLine(diff, "src/a.ts", 13)).toBe(0);
+      expect(diffDistanceToLine(diff, "src/a.ts", 16)).toBe(0);
+    });
+
+    it("returns positive distance to the nearest hunk edge for misses", () => {
+      // Hunk ends at 16, line is 20 → distance 4.
+      expect(diffDistanceToLine(diff, "src/a.ts", 20)).toBe(4);
+      // Line 9 is 1 above hunk start (10).
+      expect(diffDistanceToLine(diff, "src/a.ts", 9)).toBe(1);
+      // Between hunks: line 30. Hunk A ends at 16, Hunk B starts at
+      // 42 → distances 14 and 12 respectively → min = 12.
+      expect(diffDistanceToLine(diff, "src/a.ts", 30)).toBe(12);
+      // Past the last hunk.
+      expect(diffDistanceToLine(diff, "src/a.ts", 50)).toBe(7);
+    });
+
+    it("honours rename path aliasing (old path still resolves)", () => {
+      // Renamed file's hunk covers new-lines [5, 7]. Old path
+      // accesses the same hunk.
+      expect(diffDistanceToLine(diff, "src/old.ts", 5)).toBe(0);
+      expect(diffDistanceToLine(diff, "src/renamed.ts", 1)).toBe(4);
+    });
+
+    it("returns null for unknown files, invalid lines, or pure-deletion hunks", () => {
+      expect(diffDistanceToLine(diff, "src/other.ts", 10)).toBeNull();
+      expect(diffDistanceToLine(diff, "src/a.ts", 0)).toBeNull();
+      expect(diffDistanceToLine(diff, "src/a.ts", -1)).toBeNull();
+      expect(diffDistanceToLine(diff, "src/a.ts", Number.NaN)).toBeNull();
+
+      const delOnly = {
+        sha: "d",
+        truncated: false,
+        files: [
+          {
+            path: "src/a.ts",
+            previousPath: null,
+            status: "modified" as const,
+            additions: 0,
+            deletions: 2,
+            hunks: [{ oldStart: 10, oldLines: 2, newStart: 9, newLines: 0 }],
+          },
+        ],
+      };
+      // Every hunk is pure-deletion → no post-change coordinate to
+      // distance against → null (NOT 0 or some made-up number).
+      expect(diffDistanceToLine(delOnly, "src/a.ts", 15)).toBeNull();
+    });
+
+    it("diffTouchesLine is a thin predicate over diffDistanceToLine (exact hit only)", () => {
+      expect(diffTouchesLine(diff, "src/a.ts", 13)).toBe(true);
+      // Line 20 has distance 4 — near but not exact → predicate is false.
+      expect(diffTouchesLine(diff, "src/a.ts", 20)).toBe(false);
     });
   });
 });

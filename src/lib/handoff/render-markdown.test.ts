@@ -900,6 +900,26 @@ describe("phase 2.9 — diff-aware rendering", () => {
     expect(parts[0].startsWith("but ")).toBe(true);
     expect(parts[1].startsWith("diff touches")).toBe(true);
   });
+
+  it("(2.9.1) renders near-hit reasons with ±N suffix, same priority as exact hits", () => {
+    // Phase 2.9.1 reason shape for near hits includes the distance
+    // in parentheses. Prefix is still "diff touches " so the
+    // renderer treats it as high-priority along with exact hits.
+    const markdown = renderPacketMarkdown(
+      buildDiffPacket([
+        "matches affected area",
+        "touched 1 of 1 suspected file",
+        "merged 1 day ago",
+        "diff touches src/checkout.ts:42 (stack frame, ±3 lines)",
+      ])
+    );
+    expect(markdown).toContain(
+      "diff touches src/checkout.ts:42 (stack frame, ±3 lines)"
+    );
+    const rationale =
+      markdown.match(/_\(([\s\S]+?)\)_/)?.[1].replace(/\s+/g, " ") ?? "";
+    expect(rationale).toContain("±3 lines");
+  });
 });
 
 describe("phase 2.7 — invariants", () => {

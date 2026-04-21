@@ -736,25 +736,56 @@ export async function getCommitDiff(
 /// `[newStart, newStart + newLines)` range. Renamed files match on
 /// either the new or previous path so a stack frame pointing at the
 /// old location still resolves.
+///
+/// Kept as a thin wrapper around `diffDistanceToLine` (Phase 2.9.1)
+/// so callers that only care about the binary predicate have a
+/// self-documenting entry point.
 export function diffTouchesLine(
   diff: GithubCommitDiff,
   file: string,
   line: number
 ): boolean {
-  if (!Number.isFinite(line) || line <= 0) return false;
+  return diffDistanceToLine(diff, file, line) === 0;
+}
+
+/// Computes the minimum line distance between `line` and any hunk in
+/// the commit's diff for `file`. Graduated companion to
+/// `diffTouchesLine` introduced in Phase 2.9.1: the scorer uses
+/// distance to award a smaller "near hit" bonus when the commit
+/// changed a line nearby the stack frame (e.g. "broke the caller
+/// one line above").
+///
+/// Returns:
+///   - `0` when any hunk's post-change range `[newStart,
+///     newStart + newLines)` covers `line` (exact hit).
+///   - positive number = distance in lines to the nearest hunk edge
+///     when no hunk covers `line` but at least one is in the same
+///     file.
+///   - `null` when the file doesn't appear in the diff, `line` is
+///     not a positive finite number, or every hunk in the file is a
+///     pure deletion (`newLines === 0` — no post-change line to
+///     distance against).
+export function diffDistanceToLine(
+  diff: GithubCommitDiff,
+  file: string,
+  line: number
+): number | null {
+  if (!Number.isFinite(line) || line <= 0) return null;
+  let best: number | null = null;
   for (const f of diff.files) {
     if (f.path !== file && f.previousPath !== file) continue;
     for (const h of f.hunks) {
-      // `newLines === 0` means the hunk is a pure deletion — it
-      // doesn't cover any post-change line, so a stack frame pointing
-      // at the new file can't land inside it.
+      // Pure-deletion hunks have no post-change coordinate, so they
+      // can't be distanced against a stack-frame line. Skip.
       if (h.newLines === 0) continue;
-      if (line >= h.newStart && line < h.newStart + h.newLines) {
-        return true;
-      }
+      const start = h.newStart;
+      const end = h.newStart + h.newLines - 1;
+      if (line >= start && line <= end) return 0;
+      const distance = line < start ? start - line : line - end;
+      if (best === null || distance < best) best = distance;
     }
   }
-  return false;
+  return best;
 }
 
 export type GithubOAuthTokenResponse = {

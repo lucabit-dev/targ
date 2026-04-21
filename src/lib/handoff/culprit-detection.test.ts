@@ -925,8 +925,10 @@ describe("detectLikelyCulprit — diff-aware signal", () => {
     });
     // Probe returns true for line 42 on the resolved file — simulates
     // the diff hunk covering that line.
-    const probe = (file: string, line: number) =>
-      file === "src/checkout.ts" && line === 42;
+    // Phase 2.9.1: probes return distance (null | number). `0` = exact
+    // hit (what this test exercises); anything >0 would be a near-hit.
+    const probe = (file: string, line: number): number | null =>
+      file === "src/checkout.ts" && line === 42 ? 0 : null;
 
     const result = detectLikelyCulprit([target], {
       affectedArea: "checkout",
@@ -963,10 +965,14 @@ describe("detectLikelyCulprit — diff-aware signal", () => {
     // Only truth's diff touches line 42.
     const probes = new Map<
       string,
-      (f: string, l: number) => boolean
+      (f: string, l: number) => number | null
     >([
-      ["leader", () => false],
-      ["truth", (f, l) => f === "src/checkout.ts" && l === 42],
+      // Phase 2.9.1: null = no info; 0 = exact hit.
+      ["leader", () => null],
+      [
+        "truth",
+        (f, l) => (f === "src/checkout.ts" && l === 42 ? 0 : null),
+      ],
     ]);
 
     const result = detectLikelyCulprit([leader, truth], {
@@ -1008,9 +1014,9 @@ describe("detectLikelyCulprit — diff-aware signal", () => {
       touchedFiles: ["src/a.ts"],
       date: "2026-04-19T00:00:00Z",
     });
-    // Probe that claims "touches everything" — if invalid lines reach
-    // it, we'd incorrectly credit the bonus.
-    const probe = () => true;
+    // Probe that claims "exact hit everywhere" — if invalid lines
+    // reach it, we'd incorrectly credit the bonus.
+    const probe = () => 0;
     const result = detectLikelyCulprit([c], {
       affectedArea: "irrelevant",
       stackLines: [
@@ -1034,7 +1040,7 @@ describe("detectLikelyCulprit — diff-aware signal", () => {
       touchedFiles: ["src/a.ts"],
       date: "2026-04-19T00:00:00Z",
     });
-    const probe = () => true; // every line hits
+    const probe = () => 0; // every line is an exact hit
     const result = detectLikelyCulprit([c], {
       affectedArea: "checkout",
       stackLines: [
@@ -1068,8 +1074,8 @@ describe("detectLikelyCulprit — diff-aware signal", () => {
     });
     const probes = new Map<
       string,
-      (f: string, l: number) => boolean
-    >([["probed", () => true]]);
+      (f: string, l: number) => number | null
+    >([["probed", () => 0]]);
     const result = detectLikelyCulprit([probed, unprobed], {
       affectedArea: "checkout",
       stackLines: [{ file: "src/a.ts", line: 42 }],
@@ -1079,5 +1085,185 @@ describe("detectLikelyCulprit — diff-aware signal", () => {
     // Probed wins because of the diff bonus — unprobed has identical
     // raw signal minus the 2-point hit bonus.
     expect(result.culprit?.sha).toBe("probed");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 2.9.1 — line proximity
+// ---------------------------------------------------------------------------
+
+describe("detectLikelyCulprit — diff-aware proximity (Phase 2.9.1)", () => {
+  it("awards smaller near-hit bonus + ±N reason for distances inside the window", () => {
+    const c = commit({
+      sha: "near",
+      message: "fix: checkout",
+      touchedFiles: ["src/checkout.ts"],
+      date: "2026-04-19T00:00:00Z",
+    });
+    // Probe returns distance 3 — not an exact hit but inside the
+    // near window (DIFF_LINE_NEAR_WINDOW = 10).
+    const probe = (file: string, line: number): number | null =>
+      file === "src/checkout.ts" && line === 42 ? 3 : null;
+
+    const result = detectLikelyCulprit([c], {
+      affectedArea: "checkout",
+      resolvedFiles: ["src/checkout.ts"],
+      stackLines: [{ file: "src/checkout.ts", line: 42 }],
+      diffProbesBySha: new Map([["near", probe]]),
+      now: NOW,
+    });
+    expect(result.culprit?.sha).toBe("near");
+    // Reason must carry the ±distance so receivers know it's not an
+    // exact hit. Prefix still "diff touches " so renderer ordering
+    // treats it the same way (high-priority positive signal).
+    expect(
+      result.culprit?.reasons.some((r) =>
+        r.includes("diff touches src/checkout.ts:42 (stack frame, ±3 lines)")
+      )
+    ).toBe(true);
+  });
+
+  it("exact hit strictly outscores near hit when both are available", () => {
+    // Exact-hit commit and near-hit commit have identical keyword /
+    // file / recency signals. The exact-hit commit must win.
+    const exact = commit({
+      sha: "exact",
+      message: "fix: checkout",
+      touchedFiles: ["src/checkout.ts"],
+      date: "2026-04-19T00:00:00Z",
+    });
+    const near = commit({
+      sha: "near",
+      message: "fix: checkout",
+      touchedFiles: ["src/checkout.ts"],
+      date: "2026-04-19T00:00:00Z",
+    });
+    const probes = new Map<
+      string,
+      (f: string, l: number) => number | null
+    >([
+      ["exact", () => 0],
+      ["near", () => 5],
+    ]);
+    const result = detectLikelyCulprit([exact, near], {
+      affectedArea: "checkout",
+      resolvedFiles: ["src/checkout.ts"],
+      stackLines: [{ file: "src/checkout.ts", line: 42 }],
+      diffProbesBySha: probes,
+      now: NOW,
+    });
+    expect(result.culprit?.sha).toBe("exact");
+  });
+
+  it("no credit for distances outside the near window", () => {
+    const c = commit({
+      sha: "far",
+      message: "fix: checkout",
+      touchedFiles: ["src/checkout.ts"],
+      date: "2026-04-19T00:00:00Z",
+    });
+    // Distance 50 — nowhere near the stack frame. Should not credit.
+    const probe = (): number | null => 50;
+    const result = detectLikelyCulprit([c], {
+      affectedArea: "checkout",
+      resolvedFiles: ["src/checkout.ts"],
+      stackLines: [{ file: "src/checkout.ts", line: 42 }],
+      diffProbesBySha: new Map([["far", probe]]),
+      now: NOW,
+    });
+    expect(
+      result.culprit?.reasons.every((r) => !r.includes("diff touches"))
+    ).toBe(true);
+  });
+
+  it("picks the best (smallest-distance) stack line for the reason", () => {
+    // Commit's diff is near stack line A by 7 lines and near stack
+    // line B by 2 lines. The reason must cite B (the closer match).
+    // Message echoes area so the commit clears MIN_SCORE_MEDIUM
+    // with room to spare — we want this test to assert on reason
+    // PHRASING, not threshold behaviour.
+    const c = commit({
+      sha: "x",
+      message: "fix: checkout",
+      touchedFiles: ["src/a.ts"],
+      date: "2026-04-19T00:00:00Z",
+    });
+    const probe = (_file: string, line: number): number | null => {
+      if (line === 100) return 7;
+      if (line === 200) return 2;
+      return null;
+    };
+    const result = detectLikelyCulprit([c], {
+      affectedArea: "checkout",
+      stackLines: [
+        { file: "src/a.ts", line: 100 },
+        { file: "src/a.ts", line: 200 },
+      ],
+      diffProbesBySha: new Map([["x", probe]]),
+      now: NOW,
+    });
+    // Smaller distance wins — we cite line 200 with ±2.
+    expect(
+      result.culprit?.reasons.some((r) =>
+        r.includes("src/a.ts:200 (stack frame, ±2 lines)")
+      )
+    ).toBe(true);
+    expect(
+      result.culprit?.reasons.every(
+        (r) => !r.includes("src/a.ts:100")
+      )
+    ).toBe(true);
+  });
+
+  it("distance 0 via any line short-circuits and uses 'exact' phrasing", () => {
+    // One line is an exact hit, another is merely near. The exact
+    // hit must win and the reason must NOT carry the ±distance
+    // suffix (it's a plain exact touch).
+    const c = commit({
+      sha: "x",
+      message: "fix: checkout",
+      touchedFiles: ["src/a.ts"],
+      date: "2026-04-19T00:00:00Z",
+    });
+    const probe = (_file: string, line: number): number | null => {
+      if (line === 100) return 4; // near
+      if (line === 200) return 0; // exact
+      return null;
+    };
+    const result = detectLikelyCulprit([c], {
+      affectedArea: "checkout",
+      stackLines: [
+        { file: "src/a.ts", line: 100 },
+        { file: "src/a.ts", line: 200 },
+      ],
+      diffProbesBySha: new Map([["x", probe]]),
+      now: NOW,
+    });
+    const reasons = result.culprit?.reasons ?? [];
+    expect(reasons.some((r) => r.includes("src/a.ts:200 (stack frame)"))).toBe(
+      true
+    );
+    // No ±N suffix when we landed on an exact hit.
+    expect(reasons.every((r) => !r.includes("±"))).toBe(true);
+  });
+
+  it("a pure near-hit alone can't push a weak commit past MIN_SCORE_MEDIUM", () => {
+    // A commit with NOTHING else going for it — no keyword overlap,
+    // no recency, no file hits — should not be surfaced on near-hit
+    // alone. W_DIFF_LINE_NEAR = 1 which is below MIN_SCORE_MEDIUM.
+    const c = commit({
+      sha: "weak",
+      message: "chore: bump deps",
+      touchedFiles: [],
+      date: "2020-01-01T00:00:00Z", // old; no recency bonus
+    });
+    const probe = (): number | null => 5; // near hit
+    const result = detectLikelyCulprit([c], {
+      affectedArea: "checkout",
+      stackLines: [{ file: "src/a.ts", line: 10 }],
+      diffProbesBySha: new Map([["weak", probe]]),
+      now: NOW,
+    });
+    expect(result.culprit).toBeNull();
   });
 });

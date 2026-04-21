@@ -158,6 +158,22 @@ const NEGATIVE_SIGNAL_CONFIDENCE_CAP: LikelyCulprit["confidence"] = "medium";
 const W_DIFF_LINE_HIT = 2;
 
 // ---------------------------------------------------------------------------
+// Phase 2.9.1 — proximity tunables
+// ---------------------------------------------------------------------------
+
+/// Max line distance that still counts as "near" the stack frame.
+/// Tight enough to catch "broke the caller ± a few lines above / below"
+/// without picking up random unrelated edits elsewhere in the file.
+const DIFF_LINE_NEAR_WINDOW = 10;
+
+/// Smaller bonus awarded when the diff didn't exactly hit the stack
+/// line but changed something inside the near window. Worth enough to
+/// flip ties against a commit with no diff info, but strictly less
+/// than an exact hit so the scorer still prefers a commit that
+/// actually modified the crashing line.
+const W_DIFF_LINE_NEAR = 1;
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -199,11 +215,18 @@ export type CulpritSignals = {
   now?: Date;
 };
 
-/// Adapter-owned probe shape. Keeps the scorer decoupled from the
-/// github-client types — service-layer callers wrap their fetched
-/// `GithubCommitDiff` in a closure that captures it and invokes
-/// `diffTouchesLine` internally.
-export type CommitDiffProbe = (file: string, line: number) => boolean;
+/// Adapter-owned probe shape. Returns the minimum line distance
+/// between `line` and any hunk in the commit's diff for `file`:
+///   - `0`    → exact hit (a hunk covers `line`).
+///   - `> 0`  → distance in lines to the nearest hunk edge
+///              (Phase 2.9.1 proximity window credit).
+///   - `null` → file not in diff, invalid line, or every hunk is
+///              a pure deletion (no post-change coordinate).
+///
+/// Service-layer callers wrap their fetched `GithubCommitDiff` in a
+/// closure that invokes `diffDistanceToLine` internally, keeping the
+/// scorer decoupled from the github-client types.
+export type CommitDiffProbe = (file: string, line: number) => number | null;
 
 export type CulpritDetectionResult = {
   /// `null` when no candidate cleared the medium threshold. Distinct from
@@ -513,22 +536,46 @@ function scoreCommit(commit: CommitRef, ctx: ScoreContext): ScoredCommit {
     }
   }
 
-  // Phase 2.9 — diff-aware precision bonus. When the service has
-  // fetched this commit's diff (expensive; typically only for top-K
-  // candidates), check whether any of its hunks covers a line from
-  // the evidence stack frames. A hit means the commit *actually
-  // changed* a line in the crash trace — a qualitatively stronger
-  // signal than "touched the same file somewhere". We credit a single
-  // flat bonus regardless of how many lines hit, then push one reason
-  // bullet naming the first hit for the chip.
+  // Phase 2.9 + 2.9.1 — diff-aware precision bonus with proximity.
+  // When the service has fetched this commit's diff (expensive;
+  // typically only for top-K candidates), we look for the CLOSEST
+  // hunk to each stack-frame line:
+  //
+  //   - distance 0  → exact hit (the commit changed the crashing
+  //     line). Strong positive signal — credit W_DIFF_LINE_HIT.
+  //   - distance ≤ DIFF_LINE_NEAR_WINDOW → near hit (commit changed
+  //     a line nearby; e.g. "broke the caller one line above").
+  //     Smaller positive signal — credit W_DIFF_LINE_NEAR.
+  //   - anything else → no bonus.
+  //
+  // We credit at most once per commit and prefer the best (smallest-
+  // distance) match for the reason bullet. This keeps the score
+  // bounded and the reason chip deterministic.
   const probe = ctx.diffProbesBySha?.get(commit.sha);
   if (probe && ctx.stackLines.length > 0) {
-    const firstHit = ctx.stackLines.find((s) => probe(s.file, s.line));
-    if (firstHit) {
-      credit(W_DIFF_LINE_HIT);
-      reasons.push(
-        `diff touches ${firstHit.file}:${firstHit.line} (stack frame)`
-      );
+    let bestDistance: number | null = null;
+    let bestLine: { file: string; line: number } | null = null;
+    for (const s of ctx.stackLines) {
+      const d = probe(s.file, s.line);
+      if (d === null) continue;
+      if (bestDistance === null || d < bestDistance) {
+        bestDistance = d;
+        bestLine = s;
+        if (d === 0) break; // can't get better than exact
+      }
+    }
+    if (bestLine !== null && bestDistance !== null) {
+      if (bestDistance === 0) {
+        credit(W_DIFF_LINE_HIT);
+        reasons.push(
+          `diff touches ${bestLine.file}:${bestLine.line} (stack frame)`
+        );
+      } else if (bestDistance <= DIFF_LINE_NEAR_WINDOW) {
+        credit(W_DIFF_LINE_NEAR);
+        reasons.push(
+          `diff touches ${bestLine.file}:${bestLine.line} (stack frame, ±${bestDistance} lines)`
+        );
+      }
     }
   }
 

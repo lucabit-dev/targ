@@ -1107,6 +1107,119 @@ describe("loadRepoEnrichmentForCase", () => {
     expect(getCommitDiffMock).not.toHaveBeenCalled();
   });
 
+  // -------------------------------------------------------------------------
+  // Phase 2.9.1 — near-hit proximity credit (integration)
+  // -------------------------------------------------------------------------
+
+  it("credits a near-hit commit whose diff is ±N lines from the stack frame", async () => {
+    // Two candidates, both touching the file, both matching the
+    // area. Leader has slightly more recency. The "near" commit's
+    // diff lands 3 lines below the stack frame at line 42 (hunk at
+    // 45-46 → distance 3). Under the proximity tier, this should
+    // flip the pick with a near-hit bonus + ±3 reason.
+    caseFindUnique.mockResolvedValueOnce({
+      workspaceId: "ws-1",
+      repoLinkId: "rlink-1",
+    });
+    repoLinkFindUnique.mockResolvedValueOnce(mockRepoLink());
+    repoFileFindMany.mockResolvedValueOnce([mockFile("src/lib/checkout.ts")]);
+    repoSymbolFindMany.mockResolvedValueOnce([]);
+    githubAccountFindUnique.mockResolvedValue({
+      accessTokenEnc: "encrypted-blob",
+    });
+    getBlameMock.mockResolvedValueOnce(
+      singleRangeBlame({
+        sha: "leader-sha",
+        message: "refactor: checkout",
+        authorLogin: "alice",
+      })
+    );
+    const now = Date.now();
+    listCommitsMock.mockResolvedValueOnce([
+      {
+        sha: "leader-sha",
+        message: "refactor: checkout",
+        authorLogin: "alice",
+        authorName: "Alice",
+        authorEmail: null,
+        date: new Date(now - 1 * 86_400_000).toISOString(),
+        htmlUrl: "https://github.com/acme/checkout/commit/leader-sha",
+      },
+      {
+        sha: "near-sha",
+        message: "fix: checkout flow",
+        authorLogin: "bob",
+        authorName: "Bob",
+        authorEmail: null,
+        date: new Date(now - 2 * 86_400_000).toISOString(),
+        htmlUrl: "https://github.com/acme/checkout/commit/near-sha",
+      },
+    ]);
+
+    // Leader's hunk is FAR from line 42 (hunk at 200-201 → distance
+    // 158). Near's hunk is at 45-46 (distance 3 from line 42).
+    getCommitDiffMock.mockImplementation(async (_tok, _o, _r, sha) => {
+      if (sha === "near-sha") {
+        return {
+          sha,
+          truncated: false,
+          files: [
+            {
+              path: "src/lib/checkout.ts",
+              previousPath: null,
+              status: "modified" as const,
+              additions: 2,
+              deletions: 1,
+              hunks: [{ oldStart: 45, oldLines: 2, newStart: 45, newLines: 2 }],
+            },
+          ],
+        };
+      }
+      return {
+        sha,
+        truncated: false,
+        files: [
+          {
+            path: "src/lib/checkout.ts",
+            previousPath: null,
+            status: "modified" as const,
+            additions: 2,
+            deletions: 0,
+            hunks: [{ oldStart: 200, oldLines: 1, newStart: 200, newLines: 2 }],
+          },
+        ],
+      };
+    });
+
+    const input = sampleInput();
+    input.evidence = [
+      evidenceVM({
+        extracted: {
+          stackFrames: ["at foo (src/lib/checkout.ts:42:3)"],
+        },
+      }),
+    ];
+    input.diagnosis = diagnosisVM({
+      affectedArea: "checkout flow",
+      probableRootCause: "checkout submit broke",
+    });
+
+    const result = await loadRepoEnrichmentForCase({
+      userId: "u1",
+      caseId: "case-1",
+      input,
+    });
+
+    expect(result?.likelyCulprit?.sha).toBe("near-sha");
+    // Reason must surface the ±distance so the receiver knows this
+    // wasn't an exact hit.
+    expect(
+      result?.likelyCulprit?.reasons.some((r) =>
+        r.includes("stack frame, ±3 lines")
+      )
+    ).toBe(true);
+  });
+
   it("falls back to file-level blame when the line is outside all ranges", async () => {
     primeEnrichedCase();
     githubAccountFindUnique.mockResolvedValueOnce({
