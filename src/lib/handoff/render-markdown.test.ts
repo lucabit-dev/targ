@@ -1216,6 +1216,7 @@ describe("phase 2.10.1 — blame staleness rendering", () => {
       })
     );
     expect(markdown).toContain("**No recent culprit:**");
+    expect(markdown).not.toContain("**Together:**");
     expect(markdown).toContain("src/api/handler.ts");
     // ~30 months / ~2 years bucketing (900 days).
     expect(markdown).toMatch(/~(?:\d+ months|\d+ years) ago/);
@@ -1245,6 +1246,9 @@ describe("phase 2.10.1 — blame staleness rendering", () => {
     // Side-note format — never undermines the culprit chip.
     expect(markdown).toContain("**Blame staleness:**");
     expect(markdown).toContain("2 of 3 stack frames");
+    // Phase 2.11.1 — bridge so staleness + chips read as complementary.
+    expect(markdown).toContain("**Together:**");
+    expect(markdown).toContain("suspected-regression list");
     // Muted tone must NOT contain the strong steer.
     expect(markdown).not.toContain("**No recent culprit:**");
     expect(markdown).not.toContain("infra, data, config");
@@ -1276,6 +1280,7 @@ describe("phase 2.10.1 — blame staleness rendering", () => {
     );
     expect(markdown).toContain("**Blame staleness:**");
     expect(markdown).not.toContain("**No recent culprit:**");
+    expect(markdown).toContain("**Together:**");
   });
 
   it("singularises 'stack frame' when totalCount === 1", () => {
@@ -1339,6 +1344,82 @@ describe("phase 2.10.1 — blame staleness rendering", () => {
     // No "by @" substring — the render path must skip the author
     // clause entirely when we don't have an attribution.
     expect(markdown).not.toContain("by @");
+  });
+
+  it("does not add the Together bridge when there is staleness but no culprit or co-culprit chips", () => {
+    const markdown = renderPacketMarkdown(
+      buildStalenessPacket({
+        staleCount: 1,
+        totalCount: 3,
+        allStaleAndUnmatched: false,
+        oldest: {
+          file: "src/old.ts",
+          line: 5,
+          commitSha: "old",
+          ageDays: 200,
+          authorLogin: "x",
+        },
+      })
+    );
+    expect(markdown).toContain("**Blame staleness:**");
+    expect(markdown).not.toContain("**Together:**");
+  });
+
+  it("Phase 2.11.1: adds Together when co-culprit chips are present (even without repeating likely culprit)", () => {
+    const primarySha = "primarysha0000000000000000000000000aaa";
+    const coSha = "coculp0000000000000000000000000000bbb";
+    const markdown = renderPacketMarkdown(
+      buildHandoffPacket({
+        ...CONTRADICTION_FIXTURE_INPUT,
+        repoEnrichment: {
+          repoFullName: "acme/checkout",
+          ref: "deadbeef0000000000000000000000000000cafe",
+          suspectedRegressions: [
+            {
+              sha: primarySha,
+              message: "fix: a",
+              author: "alice",
+              date: new Date(Date.now() - 86_400_000).toISOString(),
+              touchedFiles: ["src/a.ts"],
+            },
+            {
+              sha: coSha,
+              message: "fix: b",
+              author: "bob",
+              date: new Date(Date.now() - 2 * 86_400_000).toISOString(),
+              touchedFiles: ["src/b.ts"],
+            },
+          ],
+          likelyCulprit: {
+            sha: primarySha,
+            confidence: "high",
+            reasons: ["matches"],
+          },
+          coCulprits: [
+            {
+              sha: coSha,
+              confidence: "high",
+              reasons: ["matches root cause"],
+            },
+          ],
+          blameStaleness: {
+            staleCount: 1,
+            totalCount: 2,
+            allStaleAndUnmatched: false,
+            oldest: {
+              file: "src/z.ts",
+              line: 1,
+              commitSha: "z-old",
+              ageDays: 400,
+              authorLogin: "grace",
+            },
+          },
+        },
+      })
+    );
+    expect(markdown).toContain("**Co-culprit:**");
+    expect(markdown).toContain("**Blame staleness:**");
+    expect(markdown).toContain("**Together:**");
   });
 
   it("emits nothing when blameStaleness is absent", () => {

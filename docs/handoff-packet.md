@@ -314,6 +314,11 @@ _Case: [<meta.caseId>](<meta.caseUrl>) · generated <meta.generatedAt>_
 - Line length: wrap hard at **100 chars** for readability in clipboard targets.
 - Code fences are triple-backtick with no language tag (receivers often render neutral
   blocks better than syntax-highlighted ones for mixed content).
+- After **Affected area** (when `repoContext` is rich enough), the renderer may emit—each
+  on its own wrapped line—**Likely culprit** / **Co-culprit** chips (§2.7 / §2.11) and
+  **Blame staleness** (§2.10.1). If staleness appears together with at least one culprit
+  chip, an additional italic **Together** paragraph (Phase 2.11.1) explains that recent
+  regression picks and old line-level blame are complementary signals, not a contradiction.
 
 ---
 

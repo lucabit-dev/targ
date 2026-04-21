@@ -113,8 +113,10 @@ function renderBestRead(packet: HandoffPacket): string {
   //     stack blames were fresh → side-note. The culprit chip is
   //     still the headline; we just want the agent to know the
   //     staleness context exists.
+  const coCulpritCount = packet.repoContext?.coCulprits?.length ?? 0;
   const stalenessChip = formatBlameStalenessNote(packet, {
-    hasCulprit: Boolean(culpritChip),
+    hasLikelyCulpritChip: Boolean(culpritChip),
+    hasCoCulpritChips: coCulpritCount > 0,
   });
   if (stalenessChip) {
     lines.push("", stalenessChip);
@@ -128,16 +130,26 @@ function renderBestRead(packet: HandoffPacket): string {
 /// also carries a culprit pick — a strong-tone note would undermine a
 /// high-confidence culprit chip sitting right above it.
 ///
+/// Phase 2.11.1: when staleness appears *together with* likely and/or
+/// co-culprit chips, appends a short italic **Together** paragraph so
+/// receivers do not read the two signals as contradictory (recent
+/// regression picks vs. old line-level blame).
+///
 /// Returns "" when there's no staleness data to surface.
 function formatBlameStalenessNote(
   packet: HandoffPacket,
-  params: { hasCulprit: boolean }
+  params: {
+    hasLikelyCulpritChip: boolean;
+    hasCoCulpritChips: boolean;
+  }
 ): string {
   const ctx = packet.repoContext;
   const staleness = ctx?.blameStaleness;
   if (!staleness) return "";
 
   const { oldest, staleCount, totalCount, allStaleAndUnmatched } = staleness;
+  const hasAnyAgentCulpritChip =
+    params.hasLikelyCulpritChip || params.hasCoCulpritChips;
 
   // Format age as "unknown" / "~N days" / "~N months" / "~N years"
   // at roughly human resolution. Infinity → undated blame.
@@ -160,10 +172,12 @@ function formatBlameStalenessNote(
 
   // Strong tone only fires when the signal is unambiguous:
   //   - every observed stack blame was stale AND unmatched, AND
-  //   - we didn't manage to pick a culprit (if we did, the signals
-  //     contradict each other and we err on the side of surfacing
-  //     both rather than overriding).
-  const strong = allStaleAndUnmatched && !params.hasCulprit;
+  //   - we didn't surface likely/co-culprit chips (if we did, the
+  //     signals sit side-by-side — muted staleness + bridge instead).
+  const strong =
+    allStaleAndUnmatched &&
+    !params.hasLikelyCulpritChip &&
+    !params.hasCoCulpritChips;
   if (strong) {
     return wrap(
       `**No recent culprit:** every stack-frame blame is older than the regression window — oldest is ${locationLabel} (last changed ${ageDescription}${author}). Likely not a recent-commit regression; consider infra, data, config, or traffic-pattern changes instead.`
@@ -175,9 +189,17 @@ function formatBlameStalenessNote(
   // didn't surface a confident pick).
   const fraction =
     staleCount === totalCount ? `all ${totalCount}` : `${staleCount} of ${totalCount}`;
-  return wrap(
+  const muted = wrap(
     `**Blame staleness:** ${fraction} stack frame${totalCount === 1 ? "" : "s"} were last changed >30 days ago — oldest is ${locationLabel} (${ageDescription}${author}).`
   );
+
+  // Phase 2.11.1 — reconcile with likely/co-culprit chips above.
+  if (!hasAnyAgentCulpritChip) return muted;
+
+  const bridge = wrap(
+    `_(**Together:** culprit chips highlight **recent** commits in the suspected-regression list; stale blame only means at least one stack line still points at an older SHA. Both can be true — treat chips as recent-change candidates and staleness as how old the cited line is.)_`
+  );
+  return `${muted}\n\n${bridge}`;
 }
 
 /// Renders the `repoContext.likelyCulprit` chip, e.g.:
