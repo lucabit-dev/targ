@@ -284,6 +284,49 @@ describe("cursor target rendering (spec §7.1)", () => {
     );
   });
 
+  it("inserts Phase 3.0 'Where to start' before the canonical packet when repo + culprit targets resolve", () => {
+    const packet = buildHandoffPacket({
+      ...CONTRADICTION_FIXTURE_INPUT,
+      repoEnrichment: {
+        repoFullName: "acme/checkout",
+        ref: "abcdabcdabcdabcdabcdabcdabcdabcdabcdabcd",
+        stackLocations: [
+          {
+            file: "src/lib/checkout.ts",
+            line: 42,
+            blame: {
+              author: "alice",
+              commitSha: "culpritsha00000000000000000000000aa",
+              commitMessage: "fix",
+              date: "2026-04-01T00:00:00Z",
+            },
+          },
+        ],
+        suspectedRegressions: [
+          {
+            sha: "culpritsha00000000000000000000000aa",
+            message: "fix",
+            author: "alice",
+            date: "2026-04-01T00:00:00Z",
+            touchedFiles: ["src/lib/checkout.ts"],
+          },
+        ],
+        likelyCulprit: {
+          sha: "culpritsha00000000000000000000000aa",
+          confidence: "high",
+          reasons: ["matches affected area"],
+        },
+      },
+    });
+    const cursorBody = renderForCursor(packet);
+    const whereIdx = cursorBody.indexOf("## Where to start");
+    const bestReadIdx = cursorBody.indexOf("## Best current read");
+    expect(whereIdx).toBeGreaterThan(-1);
+    expect(bestReadIdx).toBeGreaterThan(whereIdx);
+    expect(cursorBody).toContain("Cmd+P");
+    expect(cursorBody).toContain("Likely culprit");
+  });
+
   it("produces a URL-encodable body that fits under the 6 KB Cursor budget after truncation", () => {
     const packet = buildHandoffPacket(CONTRADICTION_FIXTURE_INPUT);
     const truncated = truncatePacketToBudget(

@@ -31,7 +31,7 @@ const TARGETS: TargetOption[] = [
   {
     id: "cursor",
     label: "Open in Cursor",
-    hint: "Deep link, opens with the packet as prompt.",
+    hint: "Deep link with jump targets (culprit file:line) + full packet as prompt.",
   },
   {
     id: "markdown",

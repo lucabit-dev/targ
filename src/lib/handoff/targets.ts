@@ -8,6 +8,7 @@
  *     for targets that POST to an external API (not wired in Phase 1).
  */
 
+import { renderWhereToStartSection } from "@/lib/handoff/agent-jump-targets";
 import type { HandoffPacket } from "@/lib/handoff/packet";
 import {
   renderForCursor,
@@ -53,18 +54,27 @@ function renderCursor(packet: HandoffPacket) {
 }
 
 function renderClaudeCode(packet: HandoffPacket) {
+  const where = renderWhereToStartSection(packet);
   const canonical = renderPacketMarkdown(packet);
-  const wrapped = `${CLAUDE_CODE_WRAPPER_OPEN}\n${canonical.trimEnd()}\n${CLAUDE_CODE_WRAPPER_CLOSE}`;
+  const inner = where
+    ? `${where.trimEnd()}\n\n${canonical.trimEnd()}`
+    : canonical.trimEnd();
+  const wrapped = `${CLAUDE_CODE_WRAPPER_OPEN}\n${inner}\n${CLAUDE_CODE_WRAPPER_CLOSE}`;
   return { body: appendAgentInstructions(wrapped) };
 }
 
 function renderCodex(packet: HandoffPacket) {
+  const where = renderWhereToStartSection(packet);
   const canonical = renderPacketMarkdown(packet).replace(/^# /m, "## ");
-  return { body: appendAgentInstructions(`# Task\n\n${canonical}`) };
+  const head = where ? `# Task\n\n${where}\n\n${canonical}` : `# Task\n\n${canonical}`;
+  return { body: appendAgentInstructions(head) };
 }
 
 function renderCopilotWorkspaces(packet: HandoffPacket) {
-  return { body: appendAgentInstructions(renderPacketMarkdown(packet)) };
+  const where = renderWhereToStartSection(packet);
+  const canonical = renderPacketMarkdown(packet);
+  const body = where ? `${where}\n${canonical}` : canonical;
+  return { body: appendAgentInstructions(body) };
 }
 
 const REGISTRY: Record<HandoffTargetId, TargetConfig> = {

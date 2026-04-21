@@ -12,6 +12,8 @@
  *   - Code fences use triple backticks with no language tag.
  */
 
+import { renderWhereToStartSection } from "@/lib/handoff/agent-jump-targets";
+import { buildHandoffBlobUrl } from "@/lib/handoff/github-blob-url";
 import type {
   CommitRef,
   HandoffEvidenceItem,
@@ -342,27 +344,9 @@ function formatRepoLocationLink(
   repoContext: HandoffPacket["repoContext"]
 ): string {
   const label = formatRepoLocationInline(location);
-  const url = buildBlobUrl(location, repoContext);
+  const url = buildHandoffBlobUrl(location, repoContext);
   if (!url) return `\`${label}\``;
   return `[\`${label}\`](${url})`;
-}
-
-function buildBlobUrl(
-  location: RepoLocation,
-  repoContext: HandoffPacket["repoContext"]
-): string | null {
-  if (!repoContext) return null;
-  if (!repoContext.repoFullName || !repoContext.ref) return null;
-  // Encode each path segment but keep slashes — GitHub rejects `%2F` in blob
-  // URLs. We also reject file paths with illegal control chars to avoid
-  // producing broken links when enrichment misbehaves.
-  const path = location.file
-    .split("/")
-    .map((seg) => encodeURIComponent(seg))
-    .join("/");
-  const suffix =
-    typeof location.line === "number" ? `#L${location.line}` : "";
-  return `https://github.com/${repoContext.repoFullName}/blob/${repoContext.ref}/${path}${suffix}`;
 }
 
 function renderEvidence(
@@ -656,6 +640,10 @@ const CURSOR_PREAMBLE =
   "You are triaging a bug via TARG. Use the packet below; do not invent evidence.";
 
 export function renderForCursor(packet: HandoffPacket): string {
+  const where = renderWhereToStartSection(packet);
   const base = renderPacketMarkdown(packet);
-  return appendAgentInstructions(`${CURSOR_PREAMBLE}\n\n${base}`);
+  const body = where
+    ? `${CURSOR_PREAMBLE}\n\n${where}\n${base}`
+    : `${CURSOR_PREAMBLE}\n\n${base}`;
+  return appendAgentInstructions(body);
 }
